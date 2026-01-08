@@ -1,0 +1,108 @@
+# RAG Chat Interface - Python Requirements
+# Python 3.12.7 compatible dependencies
+
+# ============================================================================
+# Core Framework & Server
+# ============================================================================
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+gunicorn==21.2.0
+python-multipart==0.0.6
+websockets==12.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# ============================================================================
+# Machine Learning & Deep Learning
+# ============================================================================
+# Install PyTorch with CUDA support:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0,<2.5.0
+transformers>=4.36.0,<4.50.0
+accelerate>=0.25.0,<1.0.0
+sentence-transformers>=2.2.0,<3.0.0
+
+# ============================================================================
+# RAG Pipeline Dependencies
+# ============================================================================
+langchain>=0.1.0
+langchain-text-splitters>=0.0.1
+langchain-community>=0.0.20
+tiktoken>=0.5.0
+
+# Vector Databases
+chromadb>=0.4.0
+lancedb>=0.4.0
+
+# Document Processing
+pymupdf>=1.24.0  # Removed upper bound - pymupdf4llm needs >=1.24.2
+pymupdf4llm>=0.0.9
+markdown-it-py>=3.0.0,<4.0.0
+
+# Search & Retrieval
+faiss-cpu>=1.7.4,<1.9.0
+rank-bm25>=0.2.2,<0.3.0
+sqlite-vss>=0.1.2,<0.2.0
+
+# Utilities
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.4,<1.15.0
+loguru>=0.7.0,<0.8.0
+diskcache>=5.6.0,<6.0.0
+networkx>=3.0,<4.0
+umap-learn>=0.5.0,<0.6.0
+
+# NLP
+spacy>=3.0.0,<4.0.0
+langdetect>=1.0.9,<2.0.0
+
+# ============================================================================
+# Optional: Audio Processing (for Voice Mode)
+# ============================================================================
+# Uncomment if you need voice features:
+# sounddevice>=0.4.6
+# soundfile>=0.12.1
+# librosa>=0.10.1
+# webrtcvad>=2.0.10
+
+# ============================================================================
+# Optional: Advanced ML Features
+# ============================================================================
+# Uncomment if you need quantization:
+# bitsandbytes>=0.42.0
+
+# ============================================================================
+# Optional: TTS Providers (EXPERIMENTAL - may have compatibility issues)
+# ============================================================================
+# These packages have known build issues with Python 3.12+
+# Install manually if needed:
+#
+# kokoro-onnx>=0.1.0
+# chatterbox-tts
+# f5-tts
+# fugashi
+# pyopenjtalk
+
+# ============================================================================
+# Installation Instructions
+# ============================================================================
+# 1. Create virtual environment:
+#    python3.12 -m venv venv
+#    source venv/bin/activate  # or: venv\Scripts\activate on Windows
+#
+# 2. Install PyTorch with CUDA support (recommended):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# 3. Install core dependencies:
+#    pip install -r requirements.txt
+#
+# 4. Download spacy language model:
+#    python -m spacy download en_core_web_sm
+pandas
+pymupdf-layout
+opencv-python-headless>=4.8.0
+sqlite-vss
+nltk
+jieba
+mecab-python3
+konlpy

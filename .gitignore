@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Data and databases - SENSITIVE
+data/
+!data/.gitkeep
+!data/*/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.pickle
+*.faiss
+*.npy
+
+# Logs - may contain sensitive info
+logs/
+*.log
+!logs/.gitkeep
+
+# Models - large files
+models/
+!models/.gitkeep
+*.bin
+*.onnx
+*.pt
+*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Linting
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Claude cache
+.claude/

@@ -1,0 +1,91 @@
+services:
+  # RAG Backend application (GPU-enabled)
+  rag-backend-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-gpu
+      args:
+        - PYTHON_VERSION=3.12
+    image: rag-backend:gpu
+    container_name: rag-backend-gpu
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount data directory for persistent storage
+      - ./data:/app/data
+      # Mount models directory (optional, for pre-downloaded models)
+      - ./models:/app/models
+      # Mount config if you want to override settings
+      - ./config:/app/config
+    env_file:
+      - .env
+    environment:
+      # GPU-specific overrides
+      - WORKERS=1
+      - EMBEDDING_DEVICE=cuda
+      - EMBEDDING_BATCH_SIZE=256
+      - CUDA_VISIBLE_DEVICES=0
+      
+      # Docker-specific configuration
+      - LLM_BASE_URL=http://host.docker.internal:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  # CPU-only service (no GPU required)
+  rag-backend-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-cpu
+      args:
+        - PYTHON_VERSION=3.12
+    image: rag-backend:cpu
+    container_name: rag-backend-cpu
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount data directory for persistent storage
+      - ./data:/app/data
+      # Mount models directory (optional, for pre-downloaded models)
+      - ./models:/app/models
+      # Mount config if you want to override settings
+      - ./config:/app/config
+    env_file:
+      - .env
+    environment:
+      # CPU-specific overrides
+      - WORKERS=2
+      - EMBEDDING_DEVICE=cpu
+      - EMBEDDING_BATCH_SIZE=128
+      - CUDA_VISIBLE_DEVICES=""
+      
+      # Docker-specific configuration
+      - LLM_BASE_URL=http://host.docker.internal:11434
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
