@@ -6,8 +6,8 @@
 # ============================================================================
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
-gunicorn==21.2.0
-python-multipart==0.0.6
+gunicorn==22.0.0
+python-multipart==0.0.18
 websockets==12.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
@@ -17,8 +17,8 @@ pydantic-settings>=2.0.0
 # ============================================================================
 # Install PyTorch with CUDA support:
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-torch>=2.0.0,<2.5.0
-transformers>=4.36.0,<4.50.0
+torch>=2.0.0,<2.10.0
+transformers>=4.36.0,<4.58.0
 accelerate>=0.25.0,<1.0.0
 sentence-transformers>=2.2.0,<3.0.0
 
