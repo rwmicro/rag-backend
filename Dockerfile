@@ -8,7 +8,7 @@
 # ------------------------------------------------------------------------------
 # Stage 1: Runtime with GPU Support (NVIDIA CUDA)
 # ------------------------------------------------------------------------------
-FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04 AS runtime-gpu
+FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04 AS runtime-gpu
 
 # Set non-interactive installation
 ARG DEBIAN_FRONTEND=noninteractive
@@ -66,13 +66,13 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8001/health || exit 1
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8001
 
 # Run application with GPU support
-CMD ["python3.12", "-m", "uvicorn", "rag.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["python3.12", "-m", "uvicorn", "rag.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime CPU-only (smaller image)
@@ -127,10 +127,10 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8001/health || exit 1
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8001
 
 # Run application (CPU mode)
-CMD ["uvicorn", "rag.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "rag.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]

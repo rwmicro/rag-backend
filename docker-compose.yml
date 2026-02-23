@@ -10,7 +10,7 @@ services:
     image: rag-backend:gpu
     container_name: rag-backend-gpu
     ports:
-      - "8000:8000"
+      - "8001:8001"
     volumes:
       # Mount data directory for persistent storage
       - ./data:/app/data
@@ -26,18 +26,23 @@ services:
       - EMBEDDING_DEVICE=cuda
       - EMBEDDING_BATCH_SIZE=256
       - CUDA_VISIBLE_DEVICES=0
-      
+      # Limit PyTorch to ~80% of VRAM (leaves ~2.4 GB free on a 12 GB card)
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+
       # Docker-specific configuration
       - LLM_BASE_URL=http://host.docker.internal:11434
+    user: "${UID:-1000}:${GID:-1000}"
+    shm_size: 2g
     deploy:
       resources:
         reservations:
+          memory: 2g
           devices:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -57,7 +62,7 @@ services:
     image: rag-backend:cpu
     container_name: rag-backend-cpu
     ports:
-      - "8000:8000"
+      - "8001:8001"
     volumes:
       # Mount data directory for persistent storage
       - ./data:/app/data
@@ -76,8 +81,13 @@ services:
       
       # Docker-specific configuration
       - LLM_BASE_URL=http://host.docker.internal:11434
+    shm_size: 1g
+    deploy:
+      resources:
+        reservations:
+          memory: 1g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
       timeout: 10s
       retries: 3
