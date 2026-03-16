@@ -67,6 +67,9 @@ from rag.validation import (
     sanitize_filename,
     ValidationError,
 )
+from rag.collections_db import CollectionsDB
+from rag.job_store import JobStore, JobStatus
+from rag.doc_registry import DocRegistry
 
 # Configure logging
 logger.remove()
@@ -221,6 +224,26 @@ class QueryRequest(BaseModel):
         True, description="Automatically detect query language"
     )
 
+    # LLM override per request
+    llm_provider: Optional[str] = Field(
+        None,
+        description="Override LLM provider: 'ollama' or 'openai_compatible'",
+    )
+    llm_model_override: Optional[str] = Field(
+        None,
+        description="Override LLM model for this request (e.g., 'llama3.2', 'gpt-4o')",
+    )
+    llm_base_url_override: Optional[str] = Field(
+        None,
+        description="Override LLM base URL for this request",
+    )
+    llm_timeout: Optional[int] = Field(
+        None,
+        description="LLM call timeout in seconds (5-300)",
+        ge=5,
+        le=300,
+    )
+
 
 class QueryResponse(BaseModel):
     """Response model for /query endpoint"""
@@ -283,26 +306,79 @@ class EvaluationResponse(BaseModel):
     timestamp: str
 
 
+class AsyncIngestResponse(BaseModel):
+    """Response model for async ingest endpoint"""
+    job_id: str
+    status: str = "queued"
+    message: str
+
+
+class JobStatusResponse(BaseModel):
+    """Response model for job status endpoint"""
+    job_id: str
+    status: str
+    progress: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class IngestFolderRequest(BaseModel):
+    """Request model for folder ingestion"""
+    folder_path: str = Field(..., description="Absolute or relative path to folder on server")
+    collection_title: str = Field(..., description="Collection name/ID")
+    llm_model: Optional[str] = Field(None, description="LLM model to use")
+    recursive: bool = Field(True, description="Process subdirectories recursively")
+    chunk_size: int = Field(1000, description="Target chunk size in tokens")
+    chunk_overlap: int = Field(200, description="Overlap between chunks")
+    chunking_strategy: str = Field("semantic", description="Chunking strategy")
+    embedding_model_name: Optional[str] = Field(None, description="Embedding model to use")
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
 
 COLLECTIONS_FILE = os.path.join(settings.DATA_DIR, "collections.json")
 
+_collections_db: Optional[CollectionsDB] = None
+_job_store: Optional[JobStore] = None
+_doc_registry: Optional[DocRegistry] = None
+
+
+def _get_collections_db() -> CollectionsDB:
+    global _collections_db
+    if _collections_db is None:
+        _collections_db = CollectionsDB(settings.COLLECTIONS_DB_PATH)
+        _collections_db.migrate_from_json(COLLECTIONS_FILE)
+    return _collections_db
+
+
+def _get_job_store() -> JobStore:
+    global _job_store
+    if _job_store is None:
+        _job_store = JobStore(settings.JOBS_DB_PATH)
+    return _job_store
+
+
+def _get_doc_registry() -> DocRegistry:
+    global _doc_registry
+    if _doc_registry is None:
+        _doc_registry = DocRegistry(settings.DOC_REGISTRY_DB_PATH)
+    return _doc_registry
+
 
 def _load_collections() -> Dict[str, Any]:
     """Load all collections metadata"""
-    if os.path.exists(COLLECTIONS_FILE):
-        with open(COLLECTIONS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return _get_collections_db().load_all()
 
 
 def _save_collections(collections: Dict[str, Any]):
-    """Save collections metadata"""
-    os.makedirs(settings.DATA_DIR, exist_ok=True)
-    with open(COLLECTIONS_FILE, "w") as f:
-        json.dump(collections, f, indent=2)
+    """Save collections metadata - now writes each collection individually"""
+    db = _get_collections_db()
+    for cid, data in collections.items():
+        db.upsert(cid, data)
 
 
 def _get_or_create_collection(
@@ -314,32 +390,32 @@ def _get_or_create_collection(
     reranker_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Get or create a collection"""
-    collections = _load_collections()
+    db = _get_collections_db()
+    existing = db.get(collection_id)
+    if existing:
+        return existing
 
-    if collection_id not in collections:
-        from datetime import datetime
-        from rag.model_registry import get_model_dimension
+    from datetime import datetime
+    from rag.model_registry import get_model_dimension
 
-        # Get embedding dimension from registry if not provided
-        if embedding_dimension is None:
-            embedding_dimension = get_model_dimension(embedding_model, "embedding")
+    if embedding_dimension is None:
+        embedding_dimension = get_model_dimension(embedding_model, "embedding")
 
-        collections[collection_id] = {
-            "id": collection_id,
-            "title": title,
-            "llm_model": llm_model,
-            "embedding_model": embedding_model,
-            "embedding_dimension": embedding_dimension,
-            "reranker_model": reranker_model or settings.RERANKER_MODEL,
-            "file_count": 0,
-            "chunk_count": 0,
-            "created_at": datetime.utcnow().isoformat(),
-            "files": [],
-            "file_metadata": {},  # NEW: stores per-file metadata {filename: {size, chunks, date}}
-        }
-        _save_collections(collections)
-
-    return collections[collection_id]
+    collection = {
+        "id": collection_id,
+        "title": title,
+        "llm_model": llm_model,
+        "embedding_model": embedding_model,
+        "embedding_dimension": embedding_dimension,
+        "reranker_model": reranker_model or settings.RERANKER_MODEL,
+        "file_count": 0,
+        "chunk_count": 0,
+        "created_at": datetime.utcnow().isoformat(),
+        "files": [],
+        "file_metadata": {},
+    }
+    db.upsert(collection_id, collection)
+    return collection
 
 
 def _update_collection_stats(
@@ -347,50 +423,39 @@ def _update_collection_stats(
 ):
     """Update collection statistics after adding a file"""
     from datetime import datetime
+    db = _get_collections_db()
+    collection = db.get(collection_id)
+    if not collection:
+        return
 
-    collections = _load_collections()
+    if "file_metadata" not in collection:
+        collection["file_metadata"] = {}
 
-    if collection_id in collections:
-        collection = collections[collection_id]
+    collection["file_metadata"][filename] = {
+        "size": file_size,
+        "chunks": num_chunks,
+        "uploaded_at": datetime.utcnow().isoformat(),
+    }
 
-        # Ensure file_metadata exists (for legacy collections)
-        if "file_metadata" not in collection:
-            collection["file_metadata"] = {}
+    if filename not in collection["files"]:
+        collection["files"].append(filename)
+        collection["file_count"] = len(collection["files"])
 
-        # Add/update file metadata
-        collection["file_metadata"][filename] = {
-            "size": file_size,
-            "chunks": num_chunks,
-            "uploaded_at": datetime.utcnow().isoformat(),
-        }
-
-        # Update legacy files list for backward compatibility
-        if filename not in collection["files"]:
-            collection["files"].append(filename)
-            collection["file_count"] = len(collection["files"])
-
-        # Update or increment chunk count
-        collection["chunk_count"] = collection.get("chunk_count", 0) + num_chunks
-
-        _save_collections(collections)
+    collection["chunk_count"] = collection.get("chunk_count", 0) + num_chunks
+    db.upsert(collection_id, collection)
 
 
 def _delete_collection(collection_id: str):
     """Delete a collection"""
-    collections = _load_collections()
-    if collection_id in collections:
-        del collections[collection_id]
-        _save_collections(collections)
+    _get_collections_db().delete(collection_id)
 
 
 def _get_collection_llm_model(collection_id: Optional[str] = None) -> str:
     """Get LLM model for a specific collection, or use global default"""
     if collection_id:
-        collections = _load_collections()
-        if collection_id in collections:
-            return collections[collection_id].get("llm_model", settings.LLM_MODEL)
-
-    # Fallback: try to load from legacy config, then settings
+        collection = _get_collections_db().get(collection_id)
+        if collection:
+            return collection.get("llm_model", settings.LLM_MODEL)
     rag_config = _load_rag_config()
     return rag_config.get("llm_model", settings.LLM_MODEL)
 
@@ -398,26 +463,18 @@ def _get_collection_llm_model(collection_id: Optional[str] = None) -> str:
 def _get_collection_embedding_model(collection_id: Optional[str] = None) -> str:
     """Get embedding model for a specific collection, or use global default"""
     if collection_id:
-        collections = _load_collections()
-        if collection_id in collections:
-            return collections[collection_id].get(
-                "embedding_model", settings.EMBEDDING_MODEL
-            )
-
-    # Fallback to global settings
+        collection = _get_collections_db().get(collection_id)
+        if collection:
+            return collection.get("embedding_model", settings.EMBEDDING_MODEL)
     return settings.EMBEDDING_MODEL
 
 
 def _get_collection_reranker_model(collection_id: Optional[str] = None) -> str:
     """Get reranker model for a specific collection, or use global default"""
     if collection_id:
-        collections = _load_collections()
-        if collection_id in collections:
-            return collections[collection_id].get(
-                "reranker_model", settings.RERANKER_MODEL
-            )
-
-    # Fallback to global settings
+        collection = _get_collections_db().get(collection_id)
+        if collection:
+            return collection.get("reranker_model", settings.RERANKER_MODEL)
     return settings.RERANKER_MODEL
 
 
@@ -434,39 +491,28 @@ def _validate_embedding_compatibility(
     Returns:
         (is_compatible, error_message, existing_dimension)
     """
-    collections = _load_collections()
+    collection = _get_collections_db().get(collection_id)
 
-    if collection_id not in collections:
-        # New collection - any model is fine
+    if collection is None:
         return True, None, None
 
-    collection = collections[collection_id]
     existing_dimension = collection.get("embedding_dimension")
     existing_model = collection.get("embedding_model")
 
-    # If no dimension stored (legacy collection), can't validate
     if existing_dimension is None:
-        logger.warning(
-            f"Collection {collection_id} has no dimension metadata, skipping validation"
-        )
+        logger.warning(f"Collection {collection_id} has no dimension metadata, skipping validation")
         return True, None, None
 
-    # Get dimension of new model
     from rag.model_registry import get_model_dimension, list_models_by_dimension
 
     new_dimension = get_model_dimension(new_embedding_model, "embedding")
 
     if new_dimension is None:
-        # Unknown model - warn but allow
-        logger.warning(
-            f"Unknown model '{new_embedding_model}', cannot validate dimension"
-        )
+        logger.warning(f"Unknown model '{new_embedding_model}', cannot validate dimension")
         return True, None, existing_dimension
 
     if new_dimension != existing_dimension:
-        # Dimension mismatch!
         compatible_models = list_models_by_dimension(existing_dimension, "embedding")
-
         error_msg = (
             f"Embedding dimension mismatch!\n\n"
             f"Collection '{collection_id}' was created with '{existing_model}' ({existing_dimension}D embeddings).\n"
@@ -477,7 +523,6 @@ def _validate_embedding_compatibility(
             f"1. Use a compatible {existing_dimension}D model\n"
             f"2. Create a new collection for {new_dimension}D embeddings"
         )
-
         return False, error_msg, existing_dimension
 
     return True, None, existing_dimension
@@ -485,12 +530,12 @@ def _validate_embedding_compatibility(
 
 def _update_collection_model(collection_id: str, llm_model: str) -> bool:
     """Update the LLM model for a collection"""
-    collections = _load_collections()
-    if collection_id not in collections:
+    db = _get_collections_db()
+    collection = db.get(collection_id)
+    if not collection:
         return False
-
-    collections[collection_id]["llm_model"] = llm_model
-    _save_collections(collections)
+    collection["llm_model"] = llm_model
+    db.upsert(collection_id, collection)
     logger.info(f"Updated collection {collection_id} LLM model to {llm_model}")
     return True
 
@@ -773,6 +818,21 @@ async def startup_event():
         successful = sum(1 for v in preload_results.values() if v)
         logger.info(f"✓ Preloaded {successful}/{len(preload_results)} models")
 
+    # Always preload the default embedding model to avoid cold start
+    logger.info("Preloading default embedding model...")
+    try:
+        embedding_model = get_or_create_embedding_model(model_name=settings.EMBEDDING_MODEL)
+        logger.info(f"✓ Preloaded embedding model: {settings.EMBEDDING_MODEL}")
+    except Exception as e:
+        logger.warning(f"Failed to preload embedding model: {e}")
+        embedding_model = None
+
+    # Initialize db singletons on startup
+    _get_collections_db()
+    _get_job_store()
+    _get_doc_registry()
+    logger.info("✓ Database singletons initialized")
+
     # NEW: Initialize advanced RAG components
     logger.info("Initializing advanced RAG components...")
 
@@ -865,7 +925,7 @@ async def _execute_rag_pipeline(
 
     # Step 0: Get or create vector store for this collection
     if request.collection_id:
-        collection = _load_collections().get(request.collection_id)
+        collection = _get_collections_db().get(request.collection_id)
         embedding_dimension = (
             collection.get("embedding_dimension") if collection else None
         )
@@ -928,13 +988,15 @@ async def _execute_rag_pipeline(
 
                 # Create collection-specific LLM generator
                 current_llm_generator = llm_generator
-                if collection_llm_model != llm_generator.model:
+                effective_model = request.llm_model_override or collection_llm_model
+                effective_timeout = request.llm_timeout or settings.LLM_TIMEOUT
+                if effective_model != llm_generator.model or effective_timeout != settings.LLM_TIMEOUT:
                     current_llm_generator = LLMGenerator(
-                        base_url=settings.LLM_BASE_URL,
-                        model=collection_llm_model,
+                        base_url=request.llm_base_url_override or settings.LLM_BASE_URL,
+                        model=effective_model,
                         temperature=settings.LLM_TEMPERATURE,
                         max_tokens=settings.LLM_MAX_TOKENS,
-                        timeout=settings.LLM_TIMEOUT,
+                        timeout=effective_timeout,
                     )
 
                 return (
@@ -1347,19 +1409,23 @@ async def _execute_rag_pipeline(
         try:
             from rag.graph_rag import GraphRAG
 
+            graph_cache_name = request.collection_id or "default"
             collection_graph_rag = GraphRAG(
                 embedding_model=current_embedding_model,
                 min_entity_mentions=2,
                 use_pagerank=True,
-                cache_dir="data/graph_cache",
+                cache_dir=settings.GRAPH_CACHE_DIR,
             )
 
-            # Build graph (lazy initialization with caching)
-            logger.info("Building knowledge graph from indexed chunks...")
-            all_chunks = [chunk for chunk, _ in chunks_with_scores]
-            collection_graph_rag.build_graph(
-                all_chunks, cache_name="global", force_rebuild=False
-            )
+            # Try to load persisted graph first
+            cache_loaded = collection_graph_rag.load_cache(graph_cache_name)
+            if not cache_loaded:
+                # Fall back to building from current chunks
+                logger.info("No persisted graph found, building from retrieved chunks...")
+                all_chunks = [chunk for chunk, _ in chunks_with_scores]
+                collection_graph_rag.build_graph(
+                    all_chunks, cache_name=graph_cache_name, force_rebuild=False
+                )
 
             # Enhance retrieval with graph
             chunks_with_scores = collection_graph_rag.retrieve_with_graph(
@@ -1462,20 +1528,37 @@ async def _execute_rag_pipeline(
             query=contextualized_query,
         )
 
-    # Step 10: Get collection-specific LLM model
+    # Step 10: Get collection-specific LLM model (with per-request overrides)
     collection_llm_model = _get_collection_llm_model(request.collection_id)
 
-    # Create collection-specific LLM generator if different from global
+    # Per-request overrides take precedence
+    effective_model = request.llm_model_override or collection_llm_model
+    effective_base_url = request.llm_base_url_override or settings.LLM_BASE_URL
+    effective_timeout = request.llm_timeout or settings.LLM_TIMEOUT
+
+    # Reuse global generator if nothing changed
     current_llm_generator = llm_generator
-    if collection_llm_model != llm_generator.model:
-        logger.info(f"Using collection-specific LLM model: {collection_llm_model}")
+    if (effective_model != llm_generator.model or
+            effective_base_url != llm_generator.base_url or
+            effective_timeout != settings.LLM_TIMEOUT or
+            request.llm_provider is not None):
+        logger.info(f"Using per-request LLM: model={effective_model}, url={effective_base_url}")
+        from rag.llm_provider import create_llm_provider
+        provider = create_llm_provider(
+            base_url=effective_base_url,
+            model=effective_model,
+            timeout=effective_timeout,
+            provider_hint=request.llm_provider,
+        )
         current_llm_generator = LLMGenerator(
-            base_url=settings.LLM_BASE_URL,
-            model=collection_llm_model,
+            base_url=effective_base_url,
+            model=effective_model,
             temperature=settings.LLM_TEMPERATURE,
             max_tokens=settings.LLM_MAX_TOKENS,
-            timeout=settings.LLM_TIMEOUT,
+            timeout=effective_timeout,
         )
+        current_llm_generator.provider = provider
+    collection_llm_model = effective_model
 
     # Step 10: Record final retrieval metrics
     query_log.timing.retrieval_ms = (time.time() - retrieval_start) * 1000
@@ -1911,6 +1994,19 @@ async def ingest_file(
         # Read file content
         content = await file.read()
 
+        # Document deduplication check
+        effective_collection = collection_title or "default"
+        file_hash = DocRegistry.compute_hash(content)
+        registry = _get_doc_registry()
+
+        if settings.SKIP_DUPLICATE_INGESTION and registry.is_duplicate(effective_collection, safe_filename, file_hash):
+            logger.info(f"Skipping duplicate document: {safe_filename} (hash match)")
+            return IngestResponse(
+                success=True,
+                message=f"Document '{safe_filename}' unchanged (identical content), skipping re-ingestion.",
+                stats={"filename": safe_filename, "skipped": True, "num_chunks": 0},
+            )
+
         # Determine file type
         doc_type = "pdf" if file.filename.endswith(".pdf") else "markdown"
 
@@ -2087,6 +2183,10 @@ async def ingest_file(
             collection_title, file.filename, len(chunks), file_size=len(content)
         )
 
+        # Register document hash for future deduplication
+        chunk_ids = [chunk.chunk_id for chunk in chunks]
+        _get_doc_registry().upsert(effective_collection, safe_filename, file_hash, chunk_ids)
+
         # Update collection LLM model if provided
         if llm_model:
             _update_collection_model(collection_title, llm_model)
@@ -2105,6 +2205,253 @@ async def ingest_file(
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingest/file/async", response_model=AsyncIngestResponse)
+async def ingest_file_async(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    collection_title: Optional[str] = Form(None),
+    llm_model: Optional[str] = Form(None),
+    chunk_size: int = Form(1000),
+    chunk_overlap: int = Form(200),
+    chunking_strategy: str = Form("semantic"),
+    embedding_model_name: Optional[str] = Form(None),
+    embedding_provider: Optional[str] = Form(None),
+    use_ollama_embedding: bool = Form(False),
+    use_hybrid_embedding: bool = Form(False),
+    use_adaptive_fusion: bool = Form(False),
+    structural_weight: float = Form(0.3),
+    reranker_model: Optional[str] = Form(None),
+):
+    """
+    Async file ingestion - returns immediately with a job_id.
+    Poll GET /ingest/jobs/{job_id} to check status.
+    """
+    try:
+        validate_file_upload(file)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Read file bytes immediately (cannot read after returning)
+    content = await file.read()
+    filename = file.filename
+    job_id = _get_job_store().create_job()
+
+    def _run_ingest_job():
+        try:
+            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.05)
+            safe_fname = sanitize_filename(filename)
+            effective_col = collection_title or "default"
+            file_hash = DocRegistry.compute_hash(content)
+
+            # Dedup check
+            if settings.SKIP_DUPLICATE_INGESTION and _get_doc_registry().is_duplicate(effective_col, safe_fname, file_hash):
+                _get_job_store().update(
+                    job_id, JobStatus.COMPLETED, progress=1.0,
+                    result={"filename": safe_fname, "skipped": True, "num_chunks": 0}
+                )
+                return
+
+            doc_type = "pdf" if filename.endswith(".pdf") else "markdown"
+            document = ingestor.ingest_from_buffer(content=content, filename=filename, doc_type=doc_type)
+            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.2)
+
+            chunker = create_chunker(
+                strategy=chunking_strategy, chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap, min_chunk_size=settings.MIN_CHUNK_SIZE,
+            )
+            chunks = chunker.chunk_document(content=document.content, metadata=document.metadata)
+            if not chunks:
+                raise ValueError(f"No chunks created from '{filename}'")
+            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.4)
+
+            embedding_model_to_use = get_or_create_embedding_model(
+                model_name=embedding_model_name,
+                provider=embedding_provider,
+                use_ollama=use_ollama_embedding,
+                use_hybrid=use_hybrid_embedding,
+                use_adaptive=use_adaptive_fusion,
+                structural_weight=structural_weight,
+            )
+            texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
+            embeddings = embedding_model_to_use.encode(texts, show_progress=False)
+            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.8)
+
+            actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk.embedding = embedding.tolist()
+            del embeddings, texts
+
+            _get_or_create_collection(
+                collection_id=effective_col, title=effective_col,
+                llm_model=llm_model or settings.LLM_MODEL,
+                embedding_model=embedding_model_name or settings.EMBEDDING_MODEL,
+                embedding_dimension=actual_dimension,
+                reranker_model=reranker_model,
+            )
+            vector_store = _get_or_create_vector_store(effective_col, actual_dimension)
+            vector_store.add_chunks(chunks)
+            _update_collection_stats(effective_col, safe_fname, len(chunks), file_size=len(content))
+            if llm_model:
+                _update_collection_model(effective_col, llm_model)
+
+            chunk_ids = [chunk.chunk_id for chunk in chunks]
+            _get_doc_registry().upsert(effective_col, safe_fname, file_hash, chunk_ids)
+
+            # Persist graph if enabled
+            if settings.USE_GRAPH_RAG_PERSISTENCE:
+                try:
+                    from rag.graph_rag import GraphRAG
+                    g = GraphRAG(embedding_model=embedding_model_to_use, cache_dir=settings.GRAPH_CACHE_DIR)
+                    g.load_cache(effective_col)
+                    g.build_graph(chunks, cache_name=effective_col, force_rebuild=False)
+                    g.save_cache(effective_col)
+                except Exception as graph_err:
+                    logger.warning(f"Graph persistence failed (non-fatal): {graph_err}")
+
+            _get_job_store().update(
+                job_id, JobStatus.COMPLETED, progress=1.0,
+                result={"filename": safe_fname, "num_chunks": len(chunks),
+                        "doc_type": doc_type, "embedding_model": embedding_model_name or settings.EMBEDDING_MODEL}
+            )
+        except Exception as e:
+            logger.error(f"Async ingest job {job_id} failed: {e}")
+            _get_job_store().update(job_id, JobStatus.FAILED, error=str(e))
+
+    background_tasks.add_task(_run_ingest_job)
+
+    return AsyncIngestResponse(
+        job_id=job_id,
+        status="queued",
+        message=f"Ingestion queued for '{file.filename}'. Poll /ingest/jobs/{job_id} for status.",
+    )
+
+
+@app.get("/ingest/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_ingest_job_status(job_id: str):
+    """Get the status of an async ingestion job"""
+    record = _get_job_store().get(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return JobStatusResponse(**record)
+
+
+@app.post("/ingest/folder", response_model=AsyncIngestResponse)
+async def ingest_folder(
+    request: IngestFolderRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Ingest all PDF and Markdown files from a local folder on the server.
+    Runs as a background job. Returns job_id immediately.
+    """
+    import os
+    folder = Path(request.folder_path)
+
+    if not folder.exists():
+        raise HTTPException(status_code=404, detail=f"Folder not found: {request.folder_path}")
+    if not folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"Path is not a directory: {request.folder_path}")
+
+    job_id = _get_job_store().create_job()
+
+    def _run_folder_job():
+        try:
+            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.0)
+            pattern = "**/*" if request.recursive else "*"
+            supported_exts = {".pdf", ".md", ".markdown", ".txt"}
+            files = [f for f in folder.glob(pattern) if f.is_file() and f.suffix.lower() in supported_exts]
+
+            if not files:
+                _get_job_store().update(
+                    job_id, JobStatus.COMPLETED, progress=1.0,
+                    result={"folder": str(folder), "files_found": 0, "total_chunks": 0}
+                )
+                return
+
+            embedding_model_to_use = get_or_create_embedding_model(
+                model_name=request.embedding_model_name
+            )
+            effective_col = request.collection_title
+
+            _get_or_create_collection(
+                collection_id=effective_col, title=effective_col,
+                llm_model=request.llm_model or settings.LLM_MODEL,
+                embedding_model=request.embedding_model_name or settings.EMBEDDING_MODEL,
+            )
+
+            total_chunks = 0
+            processed = 0
+
+            for file_path in files:
+                try:
+                    content = file_path.read_bytes()
+                    safe_fname = sanitize_filename(file_path.name)
+                    file_hash = DocRegistry.compute_hash(content)
+
+                    if settings.SKIP_DUPLICATE_INGESTION and _get_doc_registry().is_duplicate(effective_col, safe_fname, file_hash):
+                        logger.info(f"Skipping duplicate: {file_path.name}")
+                        processed += 1
+                        _get_job_store().update(job_id, JobStatus.RUNNING, progress=processed / len(files))
+                        continue
+
+                    doc_type = "pdf" if file_path.suffix.lower() == ".pdf" else "markdown"
+                    document = ingestor.ingest_from_buffer(content=content, filename=file_path.name, doc_type=doc_type)
+
+                    chunker = create_chunker(
+                        strategy=request.chunking_strategy,
+                        chunk_size=request.chunk_size,
+                        chunk_overlap=request.chunk_overlap,
+                        min_chunk_size=settings.MIN_CHUNK_SIZE,
+                    )
+                    chunks = chunker.chunk_document(content=document.content, metadata=document.metadata)
+                    if not chunks:
+                        continue
+
+                    texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
+                    embeddings = embedding_model_to_use.encode(texts, show_progress=False)
+                    actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
+                    for chunk, emb in zip(chunks, embeddings):
+                        chunk.embedding = emb.tolist()
+                    del embeddings, texts
+
+                    vector_store = _get_or_create_vector_store(effective_col, actual_dimension)
+                    vector_store.add_chunks(chunks)
+                    _update_collection_stats(effective_col, safe_fname, len(chunks), file_size=len(content))
+
+                    chunk_ids = [chunk.chunk_id for chunk in chunks]
+                    _get_doc_registry().upsert(effective_col, safe_fname, file_hash, chunk_ids)
+                    total_chunks += len(chunks)
+
+                except Exception as e:
+                    logger.warning(f"Failed to ingest {file_path.name}: {e}")
+
+                processed += 1
+                _get_job_store().update(job_id, JobStatus.RUNNING, progress=processed / len(files))
+
+            _cleanup_gpu_memory()
+
+            _get_job_store().update(
+                job_id, JobStatus.COMPLETED, progress=1.0,
+                result={
+                    "folder": str(folder),
+                    "files_found": len(files),
+                    "files_processed": processed,
+                    "total_chunks": total_chunks,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Folder ingest job {job_id} failed: {e}")
+            _get_job_store().update(job_id, JobStatus.FAILED, error=str(e))
+
+    background_tasks.add_task(_run_folder_job)
+
+    return AsyncIngestResponse(
+        job_id=job_id,
+        status="queued",
+        message=f"Folder ingestion queued for '{request.folder_path}' ({request.collection_title}). Poll /ingest/jobs/{job_id}",
+    )
 
 
 @app.post("/ingest/url", response_model=IngestResponse)

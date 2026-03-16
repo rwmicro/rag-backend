@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "llama3.2"
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2048
-    LLM_TIMEOUT: int = 120
+    LLM_TIMEOUT: int = 60
 
     # =============================================================================
     # RERANKER MODEL (Heavy - loaded at startup)
@@ -124,7 +124,7 @@ class Settings(BaseSettings):
     # =============================================================================
     # MODEL PRELOADING
     # =============================================================================
-    PRELOAD_MODELS_ON_STARTUP: bool = False
+    PRELOAD_MODELS_ON_STARTUP: bool = True
     PRELOAD_MODELS: List[str] = []
 
     # =============================================================================
@@ -159,6 +159,28 @@ class Settings(BaseSettings):
     TOP_K: int = 5
     RERANK_TOP_K: int = 3
     SIMILARITY_THRESHOLD: float = 0.5
+
+    # =============================================================================
+    # COLLECTIONS DATABASE
+    # =============================================================================
+    COLLECTIONS_DB_PATH: str = "./data/collections.db"
+
+    # =============================================================================
+    # JOB STORE (Async ingestion)
+    # =============================================================================
+    JOBS_DB_PATH: str = "./data/jobs.db"
+
+    # =============================================================================
+    # DOCUMENT REGISTRY (Deduplication)
+    # =============================================================================
+    DOC_REGISTRY_DB_PATH: str = "./data/doc_registry.db"
+    SKIP_DUPLICATE_INGESTION: bool = True
+
+    # =============================================================================
+    # GRAPH RAG PERSISTENCE
+    # =============================================================================
+    GRAPH_CACHE_DIR: str = "./data/graph_cache"
+    USE_GRAPH_RAG_PERSISTENCE: bool = True
 
     # =============================================================================
     # HELPER METHODS

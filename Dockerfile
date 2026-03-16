@@ -40,7 +40,7 @@ COPY requirements.txt .
 # Install Python dependencies (using --break-system-packages is safe in Docker)
 RUN python3.12 -m pip install --break-system-packages --no-cache-dir --upgrade --ignore-installed pip setuptools wheel && \
     python3.12 -m pip install --break-system-packages --no-cache-dir -r requirements.txt && \
-    PIP_BREAK_SYSTEM_PACKAGES=1 python3.12 -m spacy download en_core_web_sm
+    python3.12 -m pip install --break-system-packages --no-cache-dir https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
 # Create app user (security best practice)
 RUN useradd -m appuser && \
@@ -101,7 +101,7 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
-    python -m spacy download en_core_web_sm
+    pip install --no-cache-dir https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
 # Create app user
 RUN useradd -m appuser && \

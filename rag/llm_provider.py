@@ -190,7 +190,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
 
 
 def create_llm_provider(
-    base_url: str, model: str, timeout: int = 120
+    base_url: str, model: str, timeout: int = 120, provider_hint: Optional[str] = None
 ) -> BaseLLMProvider:
     """
     Factory function to create appropriate LLM provider.
@@ -199,12 +199,14 @@ def create_llm_provider(
         base_url: Base URL for LLM API
         model: Model name
         timeout: Request timeout in seconds
+        provider_hint: Force provider type: 'ollama' or 'openai_compatible'
 
     Returns:
         Appropriate LLM provider instance
     """
-    # Detect provider type from base_url
-    if "11434" in base_url or "ollama" in base_url.lower():
+    if provider_hint == "ollama" or (
+        provider_hint is None and ("11434" in base_url or "ollama" in base_url.lower())
+    ):
         logger.info(f"Creating Ollama provider for {model}")
         return OllamaProvider(base_url, model, timeout)
     else:
