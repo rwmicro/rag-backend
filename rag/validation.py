@@ -12,7 +12,7 @@ from loguru import logger
 MAX_FILE_SIZE_MB = 50  # Maximum file upload size in megabytes
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 MAX_QUERY_LENGTH = 10000  # Maximum query text length
-MAX_TOP_K = 500  # Maximum number of results to return
+MAX_TOP_K = 50  # Maximum number of results to return (aligned with QueryRequest)
 MIN_TOP_K = 1
 MAX_CHUNK_SIZE = 10000  # Maximum chunk size in characters
 MIN_CHUNK_SIZE = 10
@@ -21,14 +21,9 @@ MAX_BATCH_SIZE = 1000  # Maximum batch size for embeddings
 
 ALLOWED_FILE_EXTENSIONS = {
     ".pdf",
-    ".txt",
     ".md",
-    ".doc",
-    ".docx",
-    ".html",
-    ".json",
-    ".csv",
-    ".xml",
+    ".markdown",
+    ".txt",
 }
 
 

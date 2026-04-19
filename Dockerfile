@@ -56,10 +56,11 @@ COPY --chown=appuser:appuser . .
 RUN chmod -R u+r,g+r /app && \
     find /app -type d -exec chmod u+x,g+x {} \;
 
-# Set environment
+# Set environment (CUDA_VISIBLE_DEVICES overridable at build or runtime)
+ARG CUDA_VISIBLE_DEVICES=0
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    CUDA_VISIBLE_DEVICES=0
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 
 # Switch to non-root user
 USER appuser
@@ -117,10 +118,11 @@ COPY --chown=appuser:appuser . .
 RUN chmod -R u+r,g+r /app && \
     find /app -type d -exec chmod u+x,g+x {} \;
 
-# Set environment
+# Set environment (CPU-only stage — CUDA disabled by default, overridable)
+ARG CUDA_VISIBLE_DEVICES=""
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    CUDA_VISIBLE_DEVICES=""
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 
 # Switch to non-root user
 USER appuser

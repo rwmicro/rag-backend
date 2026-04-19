@@ -57,6 +57,15 @@ class VectorStore(ABC):
         pass
 
     @abstractmethod
+    def delete_by_chunk_ids(self, chunk_ids: List[str]) -> None:
+        """Delete specific chunks by chunk_id.
+
+        Used by incremental re-ingestion to drop chunks whose content hash
+        no longer appears in the re-chunked document.
+        """
+        pass
+
+    @abstractmethod
     def get_stats(self) -> Dict[str, Any]:
         """Get vector store statistics"""
         pass
@@ -220,40 +229,39 @@ class LanceDBStore(VectorStore):
 
         import json
 
-        # Since metadata is stored as JSON string, we need to filter differently
-        # Get all data and filter in Python
         try:
             df = self.table.to_pandas()
-
-            # Find chunk_ids to delete
             chunk_ids_to_delete = []
-            for idx, row in df.iterrows():
+            for _, row in df.iterrows():
                 metadata_json = row.get("metadata", "{}")
                 try:
-                    if isinstance(metadata_json, str):
-                        metadata = json.loads(metadata_json)
-                    else:
-                        metadata = metadata_json
-
+                    metadata = (
+                        json.loads(metadata_json)
+                        if isinstance(metadata_json, str)
+                        else metadata_json
+                    )
                     if metadata.get("filename") == filename:
                         chunk_ids_to_delete.append(row["chunk_id"])
                 except (json.JSONDecodeError, TypeError):
                     continue
 
-            # Delete by chunk_id
             if chunk_ids_to_delete:
-                for chunk_id in chunk_ids_to_delete:
-                    # Escape single quotes in chunk_id
-                    escaped_id = chunk_id.replace("'", "''")
-                    self.table.delete(f"chunk_id = '{escaped_id}'")
-                logger.info(
-                    f"Deleted {len(chunk_ids_to_delete)} chunks for file: {filename}"
-                )
+                self.delete_by_chunk_ids(chunk_ids_to_delete)
             else:
                 logger.warning(f"No chunks found for file: {filename}")
         except Exception as e:
             logger.error(f"Error deleting chunks for {filename}: {e}")
             raise
+
+    def delete_by_chunk_ids(self, chunk_ids: List[str]) -> None:
+        """Delete chunks by their chunk_ids."""
+        if self.table is None or not chunk_ids:
+            return
+
+        for chunk_id in chunk_ids:
+            escaped_id = chunk_id.replace("'", "''")
+            self.table.delete(f"chunk_id = '{escaped_id}'")
+        logger.info(f"Deleted {len(chunk_ids)} chunks by id from LanceDB")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
@@ -532,31 +540,85 @@ class FAISSStore(VectorStore):
         return MetadataFilter.matches(metadata, filter_dict)
 
     def delete_by_filename(self, filename: str) -> None:
-        """Delete chunks by filename (requires rebuilding index)"""
-        # FAISS doesn't support deletion, so we rebuild
-        new_chunks_metadata = [
-            m for m in self.chunks_metadata if m["metadata"].get("filename") != filename
+        """Delete chunks by filename (requires rebuilding the HNSW index)."""
+        chunk_ids = [
+            m["chunk_id"]
+            for m in self.chunks_metadata
+            if m["metadata"].get("filename") == filename
         ]
-
-        if len(new_chunks_metadata) == len(self.chunks_metadata):
-            return  # Nothing to delete
-
-        # Rebuild index
-        self.chunks_metadata = new_chunks_metadata
-        self._rebuild_index()
-
+        if not chunk_ids:
+            return
+        self.delete_by_chunk_ids(chunk_ids)
         logger.info(f"Deleted chunks for file: {filename}")
 
-    def _rebuild_index(self):
-        """Rebuild FAISS index from metadata"""
-        # Create new index
-        self.index = faiss.IndexHNSWFlat(self.dimension, 32)
+    def delete_by_chunk_ids(self, chunk_ids: List[str]) -> None:
+        """Delete chunks by chunk_id, rebuilding the HNSW index from kept embeddings."""
+        if not chunk_ids:
+            return
 
-        # Note: This requires embeddings to be stored in metadata
-        # For now, we'll just clear the index
-        # In production, you'd want to store embeddings and rebuild
+        ids_set = set(chunk_ids)
+        keep_mask = np.array(
+            [m["chunk_id"] not in ids_set for m in self.chunks_metadata], dtype=bool
+        )
 
-        logger.warning("FAISS index cleared (rebuild requires stored embeddings)")
+        if keep_mask.all():
+            return  # Nothing to remove
+
+        kept_metadata = [m for m, keep in zip(self.chunks_metadata, keep_mask) if keep]
+
+        if (
+            self.stored_embeddings is not None
+            and len(self.stored_embeddings) == len(self.chunks_metadata)
+        ):
+            kept_embeddings = self.stored_embeddings[keep_mask]
+        else:
+            kept_embeddings = None
+            logger.warning(
+                "FAISS stored_embeddings unavailable or out-of-sync; rebuild will clear the index"
+            )
+
+        self.chunks_metadata = kept_metadata
+        self.chunk_id_to_index = {m["chunk_id"]: i for i, m in enumerate(kept_metadata)}
+        self._rebuild_index(kept_embeddings)
+
+        if self.metadata_store:
+            for cid in chunk_ids:
+                try:
+                    self.metadata_store.delete_chunk_metadata(cid)
+                except Exception:
+                    pass
+
+        self._save_after_delete()
+        logger.info(f"Deleted {len(chunk_ids)} chunks by id from FAISS")
+
+    def _rebuild_index(self, embeddings: Optional[np.ndarray] = None):
+        """Rebuild the HNSW index from the given embeddings (or empty if None)."""
+        new_index = faiss.IndexHNSWFlat(self.dimension, 32)
+        new_index.hnsw.efConstruction = 40
+        new_index.hnsw.efSearch = 16
+
+        if embeddings is not None and len(embeddings) > 0:
+            new_index.add(embeddings.astype(np.float32))
+            self.stored_embeddings = embeddings
+        else:
+            self.stored_embeddings = None
+
+        self.index = new_index
+
+    def _save_after_delete(self):
+        """Persist index, metadata, and rewrite (not append) stored embeddings."""
+        Path(self.index_path).parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(self.index, self.index_path)
+
+        metadata_path = Path(self.index_path).with_suffix(".metadata.pkl")
+        with open(metadata_path, "wb") as f:
+            pickle.dump(self.chunks_metadata, f)
+
+        embeddings_path = Path(self.index_path).with_suffix(".embeddings.npy")
+        if self.stored_embeddings is not None and len(self.stored_embeddings) > 0:
+            np.save(embeddings_path, self.stored_embeddings)
+        elif embeddings_path.exists():
+            embeddings_path.unlink()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
@@ -683,6 +745,13 @@ class ChromaDBStore(VectorStore):
         """Delete chunks by filename"""
         self.collection.delete(where={"filename": filename})
         logger.info(f"Deleted chunks for file: {filename}")
+
+    def delete_by_chunk_ids(self, chunk_ids: List[str]) -> None:
+        """Delete chunks by chunk_id."""
+        if not chunk_ids:
+            return
+        self.collection.delete(ids=chunk_ids)
+        logger.info(f"Deleted {len(chunk_ids)} chunks by id from ChromaDB")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
@@ -969,8 +1038,6 @@ class SQLiteVectorStore(VectorStore):
         import json
 
         cursor = self.conn.cursor()
-
-        # Find chunks with matching filename in metadata
         cursor.execute("SELECT chunk_id, metadata FROM chunks")
         rows = cursor.fetchall()
 
@@ -983,31 +1050,34 @@ class SQLiteVectorStore(VectorStore):
             except json.JSONDecodeError:
                 continue
 
-        # Delete chunks
         if chunk_ids_to_delete:
-            placeholders = ",".join("?" * len(chunk_ids_to_delete))
-            cursor.execute(
-                f"""
-                DELETE FROM chunks WHERE chunk_id IN ({placeholders})
-            """,
-                chunk_ids_to_delete,
-            )
-
-            # VSS table will be cleaned up via trigger or manually
-            try:
-                cursor.execute(f"""
-                    DELETE FROM vss_chunks
-                    WHERE rowid NOT IN (SELECT rowid FROM chunks)
-                """)
-            except Exception:
-                pass
-
-            self.conn.commit()
-            logger.info(
-                f"Deleted {len(chunk_ids_to_delete)} chunks for file: {filename}"
-            )
+            self.delete_by_chunk_ids(chunk_ids_to_delete)
         else:
             logger.warning(f"No chunks found for file: {filename}")
+
+    def delete_by_chunk_ids(self, chunk_ids: List[str]) -> None:
+        """Delete chunks by chunk_id."""
+        if not chunk_ids:
+            return
+
+        cursor = self.conn.cursor()
+        placeholders = ",".join("?" * len(chunk_ids))
+        cursor.execute(
+            f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})",
+            chunk_ids,
+        )
+        cursor.execute(
+            f"DELETE FROM chunk_vectors WHERE chunk_id IN ({placeholders})",
+            chunk_ids,
+        )
+        try:
+            cursor.execute(
+                "DELETE FROM vss_chunks WHERE rowid NOT IN (SELECT rowid FROM chunks)"
+            )
+        except Exception:
+            pass
+        self.conn.commit()
+        logger.info(f"Deleted {len(chunk_ids)} chunks by id from SQLite")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""

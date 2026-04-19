@@ -3,17 +3,20 @@ FastAPI Server for RAG Pipeline
 Modern Python backend with streaming support
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
+from collections import OrderedDict
 from pathlib import Path
+from datetime import datetime, timezone
 import uvicorn
 from loguru import logger
 import sys
 import json
 import os
+import time
 import gc
 import torch
 import re
@@ -55,7 +58,6 @@ from rag.observability import (
 from rag.query_router import create_query_router
 from rag.document_summary import get_document_summarizer
 from rag.chunking import apply_contextual_embeddings
-from rag.evaluation import RAGEvaluator, EvaluationSample
 from rag.validation import (
     validate_file_upload,
     validate_query_text,
@@ -79,294 +81,38 @@ logger.add(
     level=settings.LOG_LEVEL,
 )
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="RAG Pipeline API",
-    description="Advanced RAG system with hybrid search, reranking, and compression",
-    version="2.0.0",
-)
-
-# Add CORS middleware
-# SECURITY: Configure CORS_ORIGINS in .env with specific domains for production
-# Example: CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
-cors_origins = (
-    settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS != "*" else ["*"]
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,  # IMPORTANT: Set CORS_ORIGINS in .env for production
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-    allow_headers=["Content-Type", "Authorization", "Accept"],
-)
+# FastAPI app + CORS are constructed further down, after the lifespan handler
+# is defined (it depends on module-level helpers declared below).
 
 
 # ============================================================================
-# Pydantic Models
+# Pydantic Models (moved to rag/schemas.py)
 # ============================================================================
 
-
-class ConversationMessage(BaseModel):
-    """Message in conversation history"""
-
-    role: str = Field(..., description="Message role: 'user' or 'assistant'")
-    content: str = Field(..., description="Message content")
-
-
-class QueryRequest(BaseModel):
-    """Request model for /query endpoint"""
-
-    query: str = Field(..., description="Search query")
-    conversation_history: List[ConversationMessage] = Field(
-        default_factory=list, description="Previous conversation for context"
-    )
-    collection_id: Optional[str] = Field(
-        None, description="Collection ID to query (uses collection's LLM model)"
-    )
-    top_k: int = Field(5, description="Number of results to return", ge=1, le=50)
-    auto_route: bool = Field(
-        False, description="Automatically select optimal retrieval strategy"
-    )
-    use_hybrid_search: bool = Field(
-        True, description="Use hybrid search (vector + BM25)"
-    )
-    use_multi_query: bool = Field(
-        False, description="Use multi-query retrieval (generate query variations)"
-    )
-    num_query_variations: int = Field(
-        2, description="Number of query variations for multi-query", ge=1, le=5
-    )
-    use_reranking: bool = Field(True, description="Apply reranking")
-    use_compression: bool = Field(False, description="Apply context compression")
-    use_graph_rag: bool = Field(
-        False, description="Use Graph RAG for enhanced retrieval"
-    )
-    graph_expansion_depth: int = Field(
-        1, description="Graph expansion depth for Graph RAG", ge=1, le=3
-    )
-    graph_alpha: float = Field(
-        0.7, description="Weight for vector vs graph scores (0-1)", ge=0.0, le=1.0
-    )
-    use_hyde: bool = Field(
-        False, description="Use HyDE (Hypothetical Document Embeddings)"
-    )
-    hyde_fusion: str = Field(
-        "rrf", description="HyDE fusion method: 'average', 'max', or 'rrf'"
-    )
-    num_hypothetical_docs: int = Field(
-        3, description="Number of hypothetical docs for HyDE", ge=1, le=5
-    )
-    use_adaptive_fusion: bool = Field(
-        False, description="Use adaptive embedding fusion"
-    )
-    metadata_filter: Optional[Dict[str, Any]] = Field(
-        None,
-        description="Metadata filters (e.g., {'file_type': 'pdf', 'date': {'$gte': '2024-01-01'}})",
-    )
-    system_prompt: Optional[str] = Field(None, description="Custom system prompt")
-    stream: bool = Field(True, description="Stream the response")
-
-    # NEW: Advanced RAG features
-    enable_query_classification: bool = Field(
-        False, description="Enable query classification and routing"
-    )
-    enable_adaptive_alpha: bool = Field(
-        False, description="Enable adaptive hybrid search alpha"
-    )
-    enable_mmr: bool = Field(False, description="Enable MMR diversity enforcement")
-    mmr_lambda: Optional[float] = Field(
-        None, description="MMR lambda parameter (0-1), uses settings default if None"
-    )
-    enable_contrastive: bool = Field(
-        False, description="Enable contrastive retrieval for negation handling"
-    )
-    enable_multi_hop: bool = Field(
-        False, description="Enable multi-hop retrieval for complex queries"
-    )
-    max_hops: int = Field(
-        3, description="Maximum reasoning hops for multi-hop retrieval", ge=1, le=5
-    )
-    enable_answer_verification: bool = Field(
-        False, description="Enable answer verification before presenting"
-    )
-    verification_threshold: Optional[float] = Field(
-        None, description="Minimum verification score (0-1)"
-    )
-    enable_confidence_evaluation: bool = Field(
-        False, description="Enable confidence evaluation with fallback strategies"
-    )
-    enable_feedback_logging: bool = Field(
-        True, description="Enable feedback and performance logging"
-    )
-
-    # NEW: Multilingual features
-    enable_multilingual: bool = Field(
-        False, description="Enable full multilingual pipeline"
-    )
-    query_language: Optional[str] = Field(
-        None,
-        description="Query language code (auto-detected if None, e.g., 'en', 'fr', 'es')",
-    )
-    use_multilingual_embeddings: bool = Field(
-        False,
-        description="Use multilingual-e5-large embeddings for cross-lingual retrieval",
-    )
-    use_multilingual_bm25: bool = Field(
-        False, description="Use language-specific BM25 tokenization"
-    )
-    use_multilingual_hyde: bool = Field(
-        False, description="Generate hypothetical documents in query's language"
-    )
-    use_multilingual_classifier: bool = Field(
-        False, description="Use multilingual query classification patterns"
-    )
-    detect_language: bool = Field(
-        True, description="Automatically detect query language"
-    )
-
-    # LLM override per request
-    llm_provider: Optional[str] = Field(
-        None,
-        description="Override LLM provider: 'ollama' or 'openai_compatible'",
-    )
-    llm_model_override: Optional[str] = Field(
-        None,
-        description="Override LLM model for this request (e.g., 'llama3.2', 'gpt-4o')",
-    )
-    llm_base_url_override: Optional[str] = Field(
-        None,
-        description="Override LLM base URL for this request",
-    )
-    llm_timeout: Optional[int] = Field(
-        None,
-        description="LLM call timeout in seconds (5-300)",
-        ge=5,
-        le=300,
-    )
-
-
-class QueryResponse(BaseModel):
-    """Response model for /query endpoint"""
-
-    answer: str
-    sources: List[Dict[str, Any]]
-    query: str
-    metadata: Dict[str, Any] = {}
-    llm_model: Optional[str] = None  # Model used for generation
-    collection_id: Optional[str] = None  # Collection queried
-
-
-class IngestRequest(BaseModel):
-    """Request model for /ingest endpoint"""
-
-    recursive: bool = Field(True, description="Process subdirectories recursively")
-    chunk_size: int = Field(1000, description="Target chunk size in tokens")
-    chunk_overlap: int = Field(200, description="Overlap between chunks")
-    chunking_strategy: str = Field("semantic", description="Chunking strategy")
-
-
-class IngestResponse(BaseModel):
-    """Response model for /ingest endpoint"""
-
-    success: bool
-    message: str
-    stats: Dict[str, Any]
-
-
-class StatsResponse(BaseModel):
-    """Response model for /stats endpoint"""
-
-    total_chunks: int
-    total_files: int
-    embedding_model: str
-    llm_model: Optional[str] = None
-    vector_store_type: str
-    cache_stats: Dict[str, Any]
-
-
-class EvaluationRequest(BaseModel):
-    """Request model for /evaluate endpoint"""
-
-    test_dataset: List[Dict[str, Any]] = Field(
-        ..., description="List of evaluation samples"
-    )
-    collection_id: Optional[str] = Field(None, description="Collection to evaluate on")
-    k_values: List[int] = Field([1, 3, 5, 10], description="K values for @k metrics")
-    evaluate_generation: bool = Field(
-        False, description="Also evaluate generation quality"
-    )
-
-
-class EvaluationResponse(BaseModel):
-    """Response model for /evaluate endpoint"""
-
-    retrieval_metrics: Dict[str, Any]
-    generation_metrics: Optional[Dict[str, Any]] = None
-    sample_count: int
-    timestamp: str
-
-
-class AsyncIngestResponse(BaseModel):
-    """Response model for async ingest endpoint"""
-    job_id: str
-    status: str = "queued"
-    message: str
-
-
-class JobStatusResponse(BaseModel):
-    """Response model for job status endpoint"""
-    job_id: str
-    status: str
-    progress: Optional[float] = None
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    created_at: str
-    updated_at: str
-
-
-class IngestFolderRequest(BaseModel):
-    """Request model for folder ingestion"""
-    folder_path: str = Field(..., description="Absolute or relative path to folder on server")
-    collection_title: str = Field(..., description="Collection name/ID")
-    llm_model: Optional[str] = Field(None, description="LLM model to use")
-    recursive: bool = Field(True, description="Process subdirectories recursively")
-    chunk_size: int = Field(1000, description="Target chunk size in tokens")
-    chunk_overlap: int = Field(200, description="Overlap between chunks")
-    chunking_strategy: str = Field("semantic", description="Chunking strategy")
-    embedding_model_name: Optional[str] = Field(None, description="Embedding model to use")
+from rag.schemas import (
+    ConversationMessage,
+    QueryRequest,
+    QueryResponse,
+    IngestRequest,
+    IngestResponse,
+    StatsResponse,
+    AsyncIngestResponse,
+    IngestFolderRequest,
+)
 
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
 
-COLLECTIONS_FILE = os.path.join(settings.DATA_DIR, "collections.json")
-
-_collections_db: Optional[CollectionsDB] = None
-_job_store: Optional[JobStore] = None
-_doc_registry: Optional[DocRegistry] = None
-
-
-def _get_collections_db() -> CollectionsDB:
-    global _collections_db
-    if _collections_db is None:
-        _collections_db = CollectionsDB(settings.COLLECTIONS_DB_PATH)
-        _collections_db.migrate_from_json(COLLECTIONS_FILE)
-    return _collections_db
-
-
-def _get_job_store() -> JobStore:
-    global _job_store
-    if _job_store is None:
-        _job_store = JobStore(settings.JOBS_DB_PATH)
-    return _job_store
-
-
-def _get_doc_registry() -> DocRegistry:
-    global _doc_registry
-    if _doc_registry is None:
-        _doc_registry = DocRegistry(settings.DOC_REGISTRY_DB_PATH)
-    return _doc_registry
+# Store singletons live in rag/app_state.py — re-export with the legacy
+# underscore names so existing callers in this module keep working.
+from rag.app_state import (
+    COLLECTIONS_FILE,
+    get_collections_db as _get_collections_db,
+    get_job_store as _get_job_store,
+    get_doc_registry as _get_doc_registry,
+)
 
 
 def _load_collections() -> Dict[str, Any]:
@@ -395,7 +141,6 @@ def _get_or_create_collection(
     if existing:
         return existing
 
-    from datetime import datetime
     from rag.model_registry import get_model_dimension
 
     if embedding_dimension is None:
@@ -410,7 +155,7 @@ def _get_or_create_collection(
         "reranker_model": reranker_model or settings.RERANKER_MODEL,
         "file_count": 0,
         "chunk_count": 0,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "files": [],
         "file_metadata": {},
     }
@@ -422,7 +167,6 @@ def _update_collection_stats(
     collection_id: str, filename: str, num_chunks: int, file_size: int = 0
 ):
     """Update collection statistics after adding a file"""
-    from datetime import datetime
     db = _get_collections_db()
     collection = db.get(collection_id)
     if not collection:
@@ -434,7 +178,7 @@ def _update_collection_stats(
     collection["file_metadata"][filename] = {
         "size": file_size,
         "chunks": num_chunks,
-        "uploaded_at": datetime.utcnow().isoformat(),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
 
     if filename not in collection["files"]:
@@ -456,8 +200,7 @@ def _get_collection_llm_model(collection_id: Optional[str] = None) -> str:
         collection = _get_collections_db().get(collection_id)
         if collection:
             return collection.get("llm_model", settings.LLM_MODEL)
-    rag_config = _load_rag_config()
-    return rag_config.get("llm_model", settings.LLM_MODEL)
+    return settings.LLM_MODEL
 
 
 def _get_collection_embedding_model(collection_id: Optional[str] = None) -> str:
@@ -540,26 +283,6 @@ def _update_collection_model(collection_id: str, llm_model: str) -> bool:
     return True
 
 
-# Legacy support for single collection
-RAG_CONFIG_FILE = os.path.join(settings.DATA_DIR, "rag_config.json")
-
-
-def _save_rag_config(llm_model: str):
-    """Save RAG configuration (LLM model preference) - legacy"""
-    config = {"llm_model": llm_model}
-    os.makedirs(settings.DATA_DIR, exist_ok=True)
-    with open(RAG_CONFIG_FILE, "w") as f:
-        json.dump(config, f)
-
-
-def _load_rag_config() -> Dict[str, Any]:
-    """Load RAG configuration - legacy"""
-    if os.path.exists(RAG_CONFIG_FILE):
-        with open(RAG_CONFIG_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-
 # ============================================================================
 # Global instances (initialized on startup)
 # ============================================================================
@@ -582,11 +305,29 @@ answer_verifier = None
 feedback_logger = None
 metadata_store = None
 
-# Reranker cache: stores reranker instances by model name
-_reranker_cache: Dict[str, Any] = {}
+# LRU-bounded model caches — prevents VRAM exhaustion when many models are tried.
+# Kept intentionally small since each model (especially rerankers) can be 1-4GB on GPU.
+MAX_EMBEDDING_CACHE = 3
+MAX_RERANKER_CACHE = 2
 
-# Embedding model cache: stores embedding model instances by cache key
-_embedding_model_cache: Dict[str, Any] = {}
+_reranker_cache: "OrderedDict[str, Any]" = OrderedDict()
+_embedding_model_cache: "OrderedDict[str, Any]" = OrderedDict()
+
+
+def _evict_lru(cache: "OrderedDict[str, Any]", max_size: int, cache_name: str) -> None:
+    """Evict least-recently-used entries until cache fits within max_size.
+
+    Drops references and frees GPU memory so unloaded models actually release VRAM.
+    """
+    while len(cache) > max_size:
+        key, evicted = cache.popitem(last=False)
+        logger.info(f"♻️  LRU evict {cache_name}: {key}")
+        try:
+            del evicted
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def get_or_create_embedding_model(
@@ -623,6 +364,7 @@ def get_or_create_embedding_model(
     # Check cache first
     if cache_key in _embedding_model_cache:
         cached_model = _embedding_model_cache[cache_key]
+        _embedding_model_cache.move_to_end(cache_key)
         logger.info(
             f"♻️  CACHE HIT: Using cached embedding model: {model_name} on {cached_model.device} (cache size: {len(_embedding_model_cache)})"
         )
@@ -644,6 +386,7 @@ def get_or_create_embedding_model(
 
         # Cache the model
         _embedding_model_cache[cache_key] = model
+        _evict_lru(_embedding_model_cache, MAX_EMBEDDING_CACHE, "embedding")
         logger.info(
             f"✅ Loaded and cached embedding model: {model_name} on {model.device} (cache size: {len(_embedding_model_cache)})"
         )
@@ -704,6 +447,7 @@ def get_or_create_reranker(model_name: str):
 
     # Check cache first
     if model_name in _reranker_cache:
+        _reranker_cache.move_to_end(model_name)
         logger.debug(f"Using cached reranker: {model_name}")
         return _reranker_cache[model_name]
 
@@ -716,6 +460,7 @@ def get_or_create_reranker(model_name: str):
 
         # Cache the instance
         _reranker_cache[model_name] = reranker_instance
+        _evict_lru(_reranker_cache, MAX_RERANKER_CACHE, "reranker")
         logger.info(f"✓ Loaded and cached reranker: {model_name}")
 
         return reranker_instance
@@ -733,9 +478,9 @@ def get_or_create_reranker(model_name: str):
         raise
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize components on startup"""
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Startup + shutdown hooks (replaces deprecated @app.on_event)."""
     global \
         embedding_model, \
         vector_stores, \
@@ -756,19 +501,15 @@ async def startup_event():
 
     logger.info("🚀 Starting RAG Pipeline API v2.0 (Advanced Features)")
 
-    # Ensure directories exist
     ensure_directories()
 
-    # Embedding model will be loaded lazily per collection (saves memory & startup time)
     logger.info("Embedding models will be loaded on-demand per collection")
     embedding_model = None
     retriever = None
 
-    # Vector stores will be created lazily per collection
     logger.info("Vector stores will be created on-demand per collection")
     vector_stores = {}
 
-    # Initialize default reranker (optional) and cache it
     if settings.USE_RERANKING:
         logger.info("Loading default reranker...")
         try:
@@ -777,17 +518,12 @@ async def startup_event():
             logger.warning(f"Failed to load default reranker: {e}")
             reranker = None
 
-    # Initialize compressor (optional)
     if settings.USE_COMPRESSION:
         compressor = ContextCompressor(max_tokens=settings.MAX_CONTEXT_TOKENS)
 
-    # Initialize LLM generator
     logger.info("Initializing LLM generator...")
-    # Use configured LLM model if available, otherwise use default from settings
-    rag_config = _load_rag_config()
-    llm_model = rag_config.get("llm_model") or settings.LLM_MODEL
+    llm_model = settings.LLM_MODEL
     logger.info(f"Using LLM model: {llm_model}")
-
     llm_generator = LLMGenerator(
         base_url=settings.LLM_BASE_URL,
         model=llm_model,
@@ -796,20 +532,15 @@ async def startup_event():
         timeout=settings.LLM_TIMEOUT,
     )
 
-    # Graph RAG and HyDE will be initialized lazily on first use
     graph_rag = None
     hyde = None
-
-    # Initialize document ingestor
     ingestor = DocumentIngestor()
 
-    # Initialize query router (if enabled)
     if settings.ENABLE_AUTO_ROUTING:
         logger.info("Initializing query router...")
         query_router = create_query_router(llm_generator=llm_generator)
         logger.info(f"✓ Query router initialized (mode: {settings.ROUTER_MODE})")
 
-    # Preload models if enabled
     if settings.PRELOAD_MODELS_ON_STARTUP:
         logger.info("Preloading models on startup...")
         from rag.model_validation import preload_models
@@ -818,7 +549,6 @@ async def startup_event():
         successful = sum(1 for v in preload_results.values() if v)
         logger.info(f"✓ Preloaded {successful}/{len(preload_results)} models")
 
-    # Always preload the default embedding model to avoid cold start
     logger.info("Preloading default embedding model...")
     try:
         embedding_model = get_or_create_embedding_model(model_name=settings.EMBEDDING_MODEL)
@@ -827,27 +557,26 @@ async def startup_event():
         logger.warning(f"Failed to preload embedding model: {e}")
         embedding_model = None
 
-    # Initialize db singletons on startup
     _get_collections_db()
-    _get_job_store()
+    job_store = _get_job_store()
     _get_doc_registry()
     logger.info("✓ Database singletons initialized")
 
-    # NEW: Initialize advanced RAG components
+    # Sweep orphaned jobs from a previous run (server crashed mid-ingest)
+    orphaned = job_store.mark_orphans_failed()
+    if orphaned:
+        logger.warning(f"Marked {orphaned} orphaned ingest job(s) as failed")
+
     logger.info("Initializing advanced RAG components...")
 
-    # Query Classifier
     if settings.ENABLE_QUERY_CLASSIFICATION:
-        logger.info("Initializing query classifier...")
         query_classifier = QueryClassifier(
             use_llm=settings.QUERY_CLASSIFIER_USE_LLM,
             llm_client=llm_generator if settings.QUERY_CLASSIFIER_USE_LLM else None,
         )
         logger.info("✓ Query classifier initialized")
 
-    # Confidence Evaluator
     if settings.ENABLE_FALLBACK_STRATEGIES:
-        logger.info("Initializing confidence evaluator...")
         confidence_evaluator = ConfidenceEvaluator(
             high_threshold=settings.RETRIEVAL_CONFIDENCE_HIGH,
             medium_threshold=settings.RETRIEVAL_CONFIDENCE_MEDIUM,
@@ -856,18 +585,14 @@ async def startup_event():
         )
         logger.info("✓ Confidence evaluator initialized")
 
-    # Answer Verifier
-    logger.info("Initializing answer verifier...")
     answer_verifier = AnswerVerifier(
         llm_generator=llm_generator,
-        embedding_model=None,  # Will use collection-specific embedding model
+        embedding_model=None,
         grounding_threshold=0.7,
         verification_threshold=0.6,
     )
     logger.info("✓ Answer verifier initialized")
 
-    # Feedback Logger
-    logger.info("Initializing feedback logger...")
     feedback_logger = FeedbackLogger(
         db_path=settings.FEEDBACK_DB_PATH,
         enable_logging=True,
@@ -878,12 +603,55 @@ async def startup_event():
     )
     logger.info("✓ Feedback logger initialized")
 
-    # Metadata Store
-    logger.info("Initializing metadata store...")
     metadata_store = MetadataStore(db_path=settings.METADATA_DB_PATH)
     logger.info("✓ Metadata store initialized")
 
-    logger.info("✅ RAG Pipeline API v2.0 ready with advanced features enabled!")
+    logger.info("✅ RAG Pipeline API v2.0 ready")
+
+    yield
+
+    logger.info("🛑 Shutting down RAG Pipeline API")
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="RAG Pipeline API",
+    description="Advanced RAG system with hybrid search, reranking, and compression",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+# CORS — configure CORS_ORIGINS in .env for production
+cors_origins = (
+    settings.CORS_ORIGINS.split(",") if settings.CORS_ORIGINS != "*" else ["*"]
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
+)
+
+# Domain routers (the rest of the endpoints remain inline below until they
+# are extracted alongside the pipeline logic).
+from rag.routers import (
+    health_router,
+    jobs_router,
+    cache_router,
+    config_router,
+    stats_router,
+    models_router,
+    evaluate_router,
+)
+
+app.include_router(health_router)
+app.include_router(jobs_router)
+app.include_router(cache_router)
+app.include_router(config_router)
+app.include_router(stats_router)
+app.include_router(models_router)
+app.include_router(evaluate_router)
 
 
 # ============================================================================
@@ -1007,10 +775,9 @@ async def _execute_rag_pipeline(
                     retrieval_start,
                 )
 
-        except Exception as e:
-            logger.warning(
-                f"Semantic cache lookup failed: {e}, continuing with normal retrieval"
-            )
+        except Exception:
+            logger.exception("Semantic cache lookup failed, continuing with normal retrieval")
+            query_log.metadata["semantic_cache_error"] = True
 
     # Step 2: Apply query routing if enabled
     if request.auto_route and settings.ENABLE_AUTO_ROUTING and query_router:
@@ -1190,10 +957,8 @@ async def _execute_rag_pipeline(
                         logger.info(f"Using default alpha={hybrid_alpha}")
 
                     query_log.metadata["adaptive_alpha"] = hybrid_alpha
-                except Exception as e:
-                    logger.warning(
-                        f"Adaptive alpha failed: {e}, using default alpha={settings.HYBRID_ALPHA}"
-                    )
+                except Exception:
+                    logger.exception(f"Adaptive alpha failed, using default alpha={settings.HYBRID_ALPHA}")
                     hybrid_alpha = settings.HYBRID_ALPHA
 
             current_retriever = HybridRetriever(
@@ -1246,10 +1011,9 @@ async def _execute_rag_pipeline(
                 logger.info(
                     f"Multi-hop retrieval returned {len(chunks_with_scores)} chunks"
                 )
-            except Exception as e:
-                logger.warning(
-                    f"Multi-hop retrieval failed: {e}, falling back to standard retrieval"
-                )
+            except Exception:
+                logger.exception("Multi-hop retrieval failed, falling back to standard retrieval")
+                query_log.metadata["multi_hop_error"] = True
                 chunks_with_scores = current_retriever.retrieve(
                     query=contextualized_query,
                     top_k=initial_top_k,
@@ -1282,10 +1046,9 @@ async def _execute_rag_pipeline(
                 logger.info(
                     f"Contrastive retrieval returned {len(chunks_with_scores)} chunks"
                 )
-            except Exception as e:
-                logger.warning(
-                    f"Contrastive retrieval failed: {e}, falling back to standard retrieval"
-                )
+            except Exception:
+                logger.exception("Contrastive retrieval failed, falling back to standard retrieval")
+                query_log.metadata["contrastive_error"] = True
                 chunks_with_scores = current_retriever.retrieve(
                     query=contextualized_query,
                     top_k=initial_top_k,
@@ -1436,10 +1199,9 @@ async def _execute_rag_pipeline(
                 alpha=request.graph_alpha,
             )
             logger.info(f"Graph RAG returned {len(chunks_with_scores)} enhanced chunks")
-        except Exception as e:
-            logger.warning(
-                f"Graph RAG failed: {e}, continuing without graph enhancement"
-            )
+        except Exception:
+            logger.exception("Graph RAG failed, continuing without graph enhancement")
+            query_log.metadata["graph_rag_error"] = True
 
     # Step 7: Rerank with deduplication (optional)
     if request.use_reranking:
@@ -1484,9 +1246,9 @@ async def _execute_rag_pipeline(
             query_log.retrieval.rerank_scores = [
                 float(score) for _, score in chunks_with_scores
             ]
-        except Exception as e:
-            logger.warning(f"Reranking failed: {e}, continuing without reranking")
-            # Continue without reranking on error
+        except Exception:
+            logger.exception("Reranking failed, continuing without reranking")
+            query_log.metadata["reranking_error"] = True
 
     # Step 8: Apply MMR for diversity enforcement (optional)
     if request.enable_mmr and settings.ENABLE_MMR and chunks_with_scores:
@@ -1515,10 +1277,9 @@ async def _execute_rag_pipeline(
             )
             query_log.retrieval.strategy_used.append("mmr")
             query_log.retrieval.mmr_lambda = mmr_lambda
-        except Exception as e:
-            logger.warning(
-                f"MMR diversity enforcement failed: {e}, continuing without MMR"
-            )
+        except Exception:
+            logger.exception("MMR diversity enforcement failed, continuing without MMR")
+            query_log.metadata["mmr_error"] = True
 
     # Step 9: Compress context (optional)
     if request.use_compression and compressor:
@@ -1591,8 +1352,8 @@ async def _execute_rag_pipeline(
             logger.debug(
                 f"Stored results in semantic cache for query: '{contextualized_query[:50]}...'"
             )
-        except Exception as e:
-            logger.warning(f"Failed to cache results in semantic cache: {e}")
+        except Exception:
+            logger.exception("Failed to cache results in semantic cache")
 
     return (
         chunks_with_scores,
@@ -1608,35 +1369,17 @@ async def _execute_rag_pipeline(
 # ============================================================================
 
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "status": "ok",
-        "message": "RAG Pipeline API",
-        "version": "2.0.0",
-    }
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint for Docker and monitoring"""
-    return {
-        "status": "healthy",
-        "service": "rag-backend",
-        "version": "2.0.0",
-    }
-
-
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
     """
     Query endpoint - retrieves relevant documents and generates response (non-streaming)
 
     This endpoint uses the shared RAG pipeline and returns a complete response.
-    For streaming responses, use /query/stream instead.
+    For streaming responses, use /query/stream instead, or pass stream=true.
     """
-    import time
+    # Delegate to the streaming endpoint when the client asks for streaming
+    if request.stream:
+        return await query_stream(request)
 
     # Create query log
     query_log = create_query_log(request.query, request.collection_id)
@@ -1703,79 +1446,69 @@ async def query(request: QueryRequest):
                 },
             )
 
-        # Generate response (non-streaming)
-        if not request.stream:
-            logger.info(f"Generating response with model: {collection_llm_model}...")
-            generation_start = time.time()
+        # Generate response (non-streaming; stream=true was delegated at entry)
+        logger.info(f"Generating response with model: {collection_llm_model}...")
+        generation_start = time.time()
 
-            answer = current_llm_generator.generate_rag_response(
-                query=request.query,
-                chunks_with_scores=chunks_with_scores,
-                system_prompt=request.system_prompt,
-            )
+        answer = current_llm_generator.generate_rag_response(
+            query=request.query,
+            chunks_with_scores=chunks_with_scores,
+            system_prompt=request.system_prompt,
+        )
 
-            query_log.timing.generation_ms = (time.time() - generation_start) * 1000
-            query_log.generation.model = collection_llm_model
+        query_log.timing.generation_ms = (time.time() - generation_start) * 1000
+        query_log.generation.model = collection_llm_model
 
-            # Format sources
-            sources = [
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "content": chunk.content[:500] + "..."
-                    if len(chunk.content) > 500
-                    else chunk.content,
-                    "metadata": chunk.metadata,
-                    "score": float(score),
-                }
-                for chunk, score in chunks_with_scores
-            ]
+        # Format sources
+        sources = [
+            {
+                "chunk_id": chunk.chunk_id,
+                "content": chunk.content[:500] + "..."
+                if len(chunk.content) > 500
+                else chunk.content,
+                "metadata": chunk.metadata,
+                "score": float(score),
+            }
+            for chunk, score in chunks_with_scores
+        ]
 
-            response = QueryResponse(
-                answer=answer,
-                sources=sources,
-                query=request.query,
-                llm_model=collection_llm_model,
-                collection_id=request.collection_id,
-                metadata={
-                    "num_chunks_retrieved": len(chunks_with_scores),
-                    "multi_query": request.use_multi_query,
-                    "num_query_variations": request.num_query_variations
-                    if request.use_multi_query
-                    else 0,
-                    "hyde": request.use_hyde,
-                    "hyde_fusion": request.hyde_fusion if request.use_hyde else None,
-                    "num_hypothetical_docs": request.num_hypothetical_docs
-                    if request.use_hyde
-                    else 0,
-                    "graph_rag": request.use_graph_rag,
-                    "graph_expansion_depth": request.graph_expansion_depth
-                    if request.use_graph_rag
-                    else 0,
-                    "graph_alpha": request.graph_alpha if request.use_graph_rag else 0,
-                    "adaptive_fusion": request.use_adaptive_fusion,
-                    "reranked": request.use_reranking,
-                    "compressed": request.use_compression,
-                },
-            )
+        response = QueryResponse(
+            answer=answer,
+            sources=sources,
+            query=request.query,
+            llm_model=collection_llm_model,
+            collection_id=request.collection_id,
+            metadata={
+                "num_chunks_retrieved": len(chunks_with_scores),
+                "multi_query": request.use_multi_query,
+                "num_query_variations": request.num_query_variations
+                if request.use_multi_query
+                else 0,
+                "hyde": request.use_hyde,
+                "hyde_fusion": request.hyde_fusion if request.use_hyde else None,
+                "num_hypothetical_docs": request.num_hypothetical_docs
+                if request.use_hyde
+                else 0,
+                "graph_rag": request.use_graph_rag,
+                "graph_expansion_depth": request.graph_expansion_depth
+                if request.use_graph_rag
+                else 0,
+                "graph_alpha": request.graph_alpha if request.use_graph_rag else 0,
+                "adaptive_fusion": request.use_adaptive_fusion,
+                "reranked": request.use_reranking,
+                "compressed": request.use_compression,
+            },
+        )
 
-            # Cache result
-            if settings.USE_CACHE:
-                query_cache.set(request.query, request.top_k, response)
+        # Cache result
+        if settings.USE_CACHE:
+            query_cache.set(request.query, request.top_k, response)
 
-            # Log query completion
-            query_log.timing.total_ms = (time.time() - start_time) * 1000
-            get_query_logger().log_query(query_log)
+        # Log query completion
+        query_log.timing.total_ms = (time.time() - start_time) * 1000
+        get_query_logger().log_query(query_log)
 
-            return response
-
-        # Streaming response (handled separately)
-        else:
-            # For streaming, we return a StreamingResponse
-            # Note: This is a simplified example
-            raise HTTPException(
-                status_code=400,
-                detail="Streaming not supported in this endpoint. Use /query/stream",
-            )
+        return response
 
     except Exception as e:
         logger.error(f"Query error: {e}")
@@ -1797,9 +1530,6 @@ async def query_stream(request: QueryRequest):
     It emits status updates as JSON followed by text response.
     For non-streaming responses, use /query instead.
     """
-    import time
-    import json
-
     try:
         logger.info(f"Streaming query received: {request.query[:100]}...")
 
@@ -2091,6 +1821,62 @@ async def ingest_file(
             logger.error(error_msg)
             raise HTTPException(status_code=400, detail=error_msg)
 
+        # Incremental diff: if this file was previously ingested, only embed
+        # chunks whose content hash changed, and drop chunks that no longer
+        # appear. Falls back to full re-ingest for legacy records.
+        chunks, ingest_diff, final_chunk_ids, final_chunk_hashes = registry.plan_ingest(
+            effective_collection, safe_filename, chunks
+        )
+        if ingest_diff:
+            logger.info(
+                f"Incremental ingest for {safe_filename}: "
+                f"{len(ingest_diff.unchanged)} unchanged, "
+                f"{len(ingest_diff.added)} new, "
+                f"{len(ingest_diff.removed)} removed"
+            )
+
+        # Short-circuit: only removals (no new chunks to embed).
+        if ingest_diff and not chunks and ingest_diff.removed:
+            vector_store = _get_or_create_vector_store(collection_title, None)
+            vector_store.delete_by_chunk_ids(ingest_diff.removed)
+            registry.upsert(
+                effective_collection,
+                safe_filename,
+                file_hash,
+                final_chunk_ids,
+                final_chunk_hashes,
+            )
+            _update_collection_stats(
+                collection_title, file.filename, -len(ingest_diff.removed), file_size=len(content)
+            )
+            if llm_model:
+                _update_collection_model(collection_title, llm_model)
+            return IngestResponse(
+                success=True,
+                message=f"Updated {file.filename}: {len(ingest_diff.removed)} chunks removed, nothing new to embed",
+                stats={
+                    "filename": file.filename,
+                    "num_chunks": len(final_chunk_ids),
+                    "removed": len(ingest_diff.removed),
+                    "doc_type": doc_type,
+                },
+            )
+
+        # Short-circuit: diff was fully unchanged — refresh file_hash only.
+        if ingest_diff and not chunks and not ingest_diff.removed:
+            registry.upsert(
+                effective_collection,
+                safe_filename,
+                file_hash,
+                final_chunk_ids,
+                final_chunk_hashes,
+            )
+            return IngestResponse(
+                success=True,
+                message=f"Document '{safe_filename}' chunks unchanged; refreshed file hash.",
+                stats={"filename": safe_filename, "num_chunks": len(final_chunk_ids), "skipped": True},
+            )
+
         # Apply contextual embeddings if enabled
         if settings.USE_CONTEXTUAL_EMBEDDINGS:
             logger.info("Generating document summary for contextual embeddings...")
@@ -2176,6 +1962,10 @@ async def ingest_file(
         logger.info(f"Getting vector store for collection: {collection_title}")
         vector_store = _get_or_create_vector_store(collection_title, actual_dimension)
 
+        # Drop stale chunks before adding the new ones so chunk_id re-use is safe.
+        if ingest_diff and ingest_diff.removed:
+            vector_store.delete_by_chunk_ids(ingest_diff.removed)
+
         # Index chunks in vector store
         logger.info("Indexing chunks in vector store...")
         vector_store.add_chunks(chunks)
@@ -2184,8 +1974,13 @@ async def ingest_file(
         )
 
         # Register document hash for future deduplication
-        chunk_ids = [chunk.chunk_id for chunk in chunks]
-        _get_doc_registry().upsert(effective_collection, safe_filename, file_hash, chunk_ids)
+        registry.upsert(
+            effective_collection,
+            safe_filename,
+            file_hash,
+            final_chunk_ids,
+            final_chunk_hashes,
+        )
 
         # Update collection LLM model if provided
         if llm_model:
@@ -2266,22 +2061,35 @@ async def ingest_file_async(
                 raise ValueError(f"No chunks created from '{filename}'")
             _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.4)
 
-            embedding_model_to_use = get_or_create_embedding_model(
-                model_name=embedding_model_name,
-                provider=embedding_provider,
-                use_ollama=use_ollama_embedding,
-                use_hybrid=use_hybrid_embedding,
-                use_adaptive=use_adaptive_fusion,
-                structural_weight=structural_weight,
+            registry = _get_doc_registry()
+            chunks, ingest_diff, final_chunk_ids, final_chunk_hashes = registry.plan_ingest(
+                effective_col, safe_fname, chunks
             )
-            texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
-            embeddings = embedding_model_to_use.encode(texts, show_progress=False)
-            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.8)
+            if ingest_diff:
+                logger.info(
+                    f"Incremental async ingest for {safe_fname}: "
+                    f"{len(ingest_diff.unchanged)} unchanged, "
+                    f"{len(ingest_diff.added)} new, "
+                    f"{len(ingest_diff.removed)} removed"
+                )
 
-            actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
-            for chunk, embedding in zip(chunks, embeddings):
-                chunk.embedding = embedding.tolist()
-            del embeddings, texts
+            actual_dimension = None
+            if chunks:
+                embedding_model_to_use = get_or_create_embedding_model(
+                    model_name=embedding_model_name,
+                    provider=embedding_provider,
+                    use_ollama=use_ollama_embedding,
+                    use_hybrid=use_hybrid_embedding,
+                    use_adaptive=use_adaptive_fusion,
+                    structural_weight=structural_weight,
+                )
+                texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
+                embeddings = embedding_model_to_use.encode(texts, show_progress=False)
+                actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
+                for chunk, embedding in zip(chunks, embeddings):
+                    chunk.embedding = embedding.tolist()
+                del embeddings, texts
+            _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.8)
 
             _get_or_create_collection(
                 collection_id=effective_col, title=effective_col,
@@ -2291,16 +2099,20 @@ async def ingest_file_async(
                 reranker_model=reranker_model,
             )
             vector_store = _get_or_create_vector_store(effective_col, actual_dimension)
-            vector_store.add_chunks(chunks)
-            _update_collection_stats(effective_col, safe_fname, len(chunks), file_size=len(content))
+            if ingest_diff and ingest_diff.removed:
+                vector_store.delete_by_chunk_ids(ingest_diff.removed)
+            if chunks:
+                vector_store.add_chunks(chunks)
+                _update_collection_stats(effective_col, safe_fname, len(chunks), file_size=len(content))
+            elif ingest_diff and ingest_diff.removed:
+                _update_collection_stats(effective_col, safe_fname, -len(ingest_diff.removed), file_size=len(content))
             if llm_model:
                 _update_collection_model(effective_col, llm_model)
 
-            chunk_ids = [chunk.chunk_id for chunk in chunks]
-            _get_doc_registry().upsert(effective_col, safe_fname, file_hash, chunk_ids)
+            registry.upsert(effective_col, safe_fname, file_hash, final_chunk_ids, final_chunk_hashes)
 
-            # Persist graph if enabled
-            if settings.USE_GRAPH_RAG_PERSISTENCE:
+            # Persist graph if enabled (skip on delete-only re-ingest — no new chunks)
+            if chunks and settings.USE_GRAPH_RAG_PERSISTENCE:
                 try:
                     from rag.graph_rag import GraphRAG
                     g = GraphRAG(embedding_model=embedding_model_to_use, cache_dir=settings.GRAPH_CACHE_DIR)
@@ -2326,15 +2138,6 @@ async def ingest_file_async(
         status="queued",
         message=f"Ingestion queued for '{file.filename}'. Poll /ingest/jobs/{job_id} for status.",
     )
-
-
-@app.get("/ingest/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_ingest_job_status(job_id: str):
-    """Get the status of an async ingestion job"""
-    record = _get_job_store().get(job_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    return JobStatusResponse(**record)
 
 
 @app.post("/ingest/folder", response_model=AsyncIngestResponse)
@@ -2409,19 +2212,28 @@ async def ingest_folder(
                     if not chunks:
                         continue
 
-                    texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
-                    embeddings = embedding_model_to_use.encode(texts, show_progress=False)
-                    actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
-                    for chunk, emb in zip(chunks, embeddings):
-                        chunk.embedding = emb.tolist()
-                    del embeddings, texts
+                    registry = _get_doc_registry()
+                    chunks, ingest_diff, final_chunk_ids, final_chunk_hashes = registry.plan_ingest(
+                        effective_col, safe_fname, chunks
+                    )
+
+                    actual_dimension = None
+                    if chunks:
+                        texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
+                        embeddings = embedding_model_to_use.encode(texts, show_progress=False)
+                        actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
+                        for chunk, emb in zip(chunks, embeddings):
+                            chunk.embedding = emb.tolist()
+                        del embeddings, texts
 
                     vector_store = _get_or_create_vector_store(effective_col, actual_dimension)
-                    vector_store.add_chunks(chunks)
-                    _update_collection_stats(effective_col, safe_fname, len(chunks), file_size=len(content))
+                    if ingest_diff and ingest_diff.removed:
+                        vector_store.delete_by_chunk_ids(ingest_diff.removed)
+                    if chunks:
+                        vector_store.add_chunks(chunks)
+                        _update_collection_stats(effective_col, safe_fname, len(chunks), file_size=len(content))
 
-                    chunk_ids = [chunk.chunk_id for chunk in chunks]
-                    _get_doc_registry().upsert(effective_col, safe_fname, file_hash, chunk_ids)
+                    registry.upsert(effective_col, safe_fname, file_hash, final_chunk_ids, final_chunk_hashes)
                     total_chunks += len(chunks)
 
                 except Exception as e:
@@ -2686,127 +2498,12 @@ async def ingest_directory(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats", response_model=StatsResponse)
-async def get_stats():
-    """Get system statistics"""
-    try:
-        # Aggregate vector store stats from all collections
-        total_chunks = 0
-        total_files = 0
-
-        for collection_id, store in vector_stores.items():
-            try:
-                stats = store.get_stats()
-                total_chunks += stats.get("total_chunks", 0)
-                total_files += stats.get("total_files", 0)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to get stats for collection {collection_id}: {e}"
-                )
-
-        # Get cache stats
-        cache = get_query_cache().cache
-        cache_stats = {}
-        if hasattr(cache, "stats"):
-            cache_stats = cache.stats()
-
-        # Get RAG config (LLM model)
-        rag_config = _load_rag_config()
-
-        return StatsResponse(
-            total_chunks=total_chunks,
-            total_files=total_files,
-            embedding_model=settings.EMBEDDING_MODEL,
-            llm_model=rag_config.get("llm_model"),
-            vector_store_type=settings.VECTOR_STORE_TYPE,
-            cache_stats=cache_stats,
-        )
-
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/cache")
-async def clear_cache():
-    """Clear all caches"""
-    try:
-        from rag.cache import get_cache
-
-        cache = get_cache()
-        cache.clear()
-
-        return {"success": True, "message": "Cache cleared"}
-
-    except Exception as e:
-        logger.error(f"Cache clear error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/cache/graph")
-async def clear_graph_cache(cache_name: Optional[str] = None):
-    """Clear graph cache"""
-    try:
-        if graph_rag:
-            graph_rag.clear_cache(cache_name)
-            return {
-                "success": True,
-                "message": f"Graph cache {'(' + cache_name + ') ' if cache_name else ''}cleared",
-            }
-        else:
-            return {"success": False, "message": "Graph RAG not initialized"}
-
-    except Exception as e:
-        logger.error(f"Graph cache clear error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/collections")
 async def list_collections():
     """List all RAG collections"""
     try:
         collections = _load_collections()
-
-        # Migration: If no collections but we have data in vector store, create a default collection
-        # Disable this after initial migration to allow users to delete all collections
-        ENABLE_AUTO_MIGRATION = (
-            False  # Set to True only if you need to migrate old data
-        )
-
-        if len(collections) == 0 and ENABLE_AUTO_MIGRATION and len(vector_stores) > 0:
-            # Try to get stats from "default" collection store if it exists
-            default_store = vector_stores.get("default")
-            if default_store:
-                vs_stats = default_store.get_stats()
-                total_chunks = vs_stats.get("total_chunks", 0)
-                total_files = vs_stats.get("total_files", 0)
-
-                if total_chunks > 0:
-                    # Load legacy config
-                    rag_config = _load_rag_config()
-                    llm_model = rag_config.get("llm_model", settings.LLM_MODEL)
-
-                    # Create default collection from existing data
-                    from datetime import datetime
-
-                    default_collection = {
-                        "id": "default",
-                        "title": "My Documents",
-                        "llm_model": llm_model,
-                        "embedding_model": settings.EMBEDDING_MODEL,
-                        "file_count": total_files,
-                        "chunk_count": total_chunks,
-                        "created_at": datetime.utcnow().isoformat(),
-                        "files": [],
-                    }
-                    collections["default"] = default_collection
-                _save_collections(collections)
-                logger.info(
-                    f"Migrated existing data to default collection: {total_files} files, {total_chunks} chunks"
-                )
-
         collection_list = list(collections.values())
-
         return {"collections": collection_list, "total": len(collection_list)}
 
     except Exception as e:
@@ -3144,20 +2841,6 @@ async def delete_collection(collection_id: str):
                     corpus_file.unlink()
                     deleted_files.append(str(corpus_file))
                     logger.info(f"Deleted corpus file: {corpus_file}")
-
-        # Delete any temporary files related to this collection
-        temp_dir = Path("/tmp")
-        if temp_dir.exists():
-            for temp_file in temp_dir.glob(f"**/*{collection_id}*"):
-                if temp_file.is_file():
-                    try:
-                        temp_file.unlink()
-                        deleted_files.append(str(temp_file))
-                        logger.info(f"Deleted temporary file: {temp_file}")
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to delete temporary file {temp_file}: {e}"
-                        )
 
         # Delete index files if they exist
         index_dir = Path(settings.INDEX_DIR)
@@ -3565,716 +3248,6 @@ async def get_collection_umap(
         raise
     except Exception as e:
         logger.error(f"Get collection UMAP error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/models")
-async def get_available_models(
-    check_availability: bool = False,
-    model_type: Optional[str] = None,
-):
-    """
-    Get available models with metadata
-
-    Args:
-        check_availability: Check actual model availability (slower, queries Ollama/HF)
-        model_type: Filter by type: "embedding", "reranker", "all" (default: "all")
-
-    Returns:
-        Dictionary with embedding and reranker models and their metadata
-    """
-    try:
-        from rag.model_registry import (
-            EMBEDDING_MODELS,
-            RERANKER_MODELS,
-            OLLAMA_EMBEDDING_MODELS,
-            to_dict,
-        )
-        from rag.model_validation import get_model_validator
-
-        response = {}
-
-        # Get embedding models if requested
-        if model_type in [None, "all", "embedding"]:
-            embedding_models = []
-
-            # HuggingFace embedding models
-            for shortcut, info in EMBEDDING_MODELS.items():
-                model_data = to_dict(info)
-                model_data["shortcut"] = shortcut
-                model_data["available"] = None
-
-                # Check availability if requested
-                if check_availability:
-                    validator = get_model_validator()
-                    is_valid, error_msg = validator.validate_embedding_model(
-                        info.name, check_availability=True
-                    )
-                    model_data["available"] = is_valid
-                    model_data["error"] = error_msg if not is_valid else None
-
-                embedding_models.append(model_data)
-
-            # Ollama embedding models - query actual installed models
-            try:
-                import requests
-
-                ollama_response = requests.get(
-                    f"{settings.LLM_BASE_URL}/api/tags", timeout=5
-                )
-
-                if ollama_response.status_code == 200:
-                    ollama_data = ollama_response.json()
-                    ollama_model_names = [
-                        model["name"] for model in ollama_data.get("models", [])
-                    ]
-
-                    # Filter for embedding models (contain "embed" in name)
-                    ollama_embedding_names = [
-                        name for name in ollama_model_names if "embed" in name.lower()
-                    ]
-
-                    # Add each Ollama embedding model
-                    for model_name in ollama_embedding_names:
-                        # Check if it's in our registry first
-                        info = None
-                        for shortcut, registry_info in OLLAMA_EMBEDDING_MODELS.items():
-                            if (
-                                registry_info.name == model_name
-                                or model_name.startswith(registry_info.name)
-                            ):
-                                info = registry_info
-                                break
-
-                        if info:
-                            # Use registry info if available
-                            model_data = to_dict(info)
-                            model_data["shortcut"] = (
-                                None  # No shortcut for Ollama models
-                            )
-                        else:
-                            # Create model data for unknown Ollama embedding model
-                            model_data = {
-                                "name": model_name,
-                                "dimension": 768,  # Default, may vary
-                                "max_seq_length": 2048,  # Default for Ollama
-                                "model_type": "ollama",
-                                "description": f"Ollama embedding model - {model_name}",
-                                "size_mb": None,
-                                "shortcut": None,
-                            }
-
-                        model_data["available"] = True  # If listed, it's available
-                        embedding_models.append(model_data)
-                else:
-                    logger.warning(
-                        f"Failed to fetch Ollama models: {ollama_response.status_code}"
-                    )
-                    # Fallback to static registry if Ollama query fails
-                    for shortcut, info in OLLAMA_EMBEDDING_MODELS.items():
-                        model_data = to_dict(info)
-                        model_data["shortcut"] = shortcut
-                        model_data["available"] = False
-                        embedding_models.append(model_data)
-
-            except Exception as e:
-                logger.warning(f"Could not query Ollama for models: {e}")
-                # Fallback to static registry
-                for shortcut, info in OLLAMA_EMBEDDING_MODELS.items():
-                    model_data = to_dict(info)
-                    model_data["shortcut"] = shortcut
-                    model_data["available"] = None
-                    embedding_models.append(model_data)
-
-            response["embedding_models"] = embedding_models
-
-        # Get reranker models if requested
-        if model_type in [None, "all", "reranker"]:
-            reranker_models = []
-
-            for shortcut, info in RERANKER_MODELS.items():
-                model_data = to_dict(info)
-                model_data["shortcut"] = shortcut
-                model_data["available"] = None
-
-                # Check availability if requested
-                if check_availability:
-                    validator = get_model_validator()
-                    is_valid, error_msg = validator.validate_reranker_model(info.name)
-                    model_data["available"] = is_valid
-                    model_data["error"] = error_msg if not is_valid else None
-
-                reranker_models.append(model_data)
-
-            response["reranker_models"] = reranker_models
-
-        # Add current configuration
-        response["current_config"] = {
-            "embedding_model": settings.EMBEDDING_MODEL,
-            "embedding_dimension": settings.EMBEDDING_DIMENSION,
-            "reranker_model": settings.RERANKER_MODEL,
-            "llm_model": settings.LLM_MODEL,
-        }
-
-        # Add metadata
-        response["metadata"] = {
-            "total_embedding_models": len(response.get("embedding_models", [])),
-            "total_reranker_models": len(response.get("reranker_models", [])),
-            "availability_checked": check_availability,
-        }
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Get models error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health/models")
-async def health_models():
-    """
-    Get health status of models and model infrastructure
-
-    Returns:
-        Status of Ollama connection, cached models, and model readiness
-    """
-    try:
-        from rag.model_validation import get_model_validator
-
-        health_info = {
-            "status": "ok",
-            "ollama": {},
-            "cached_models": {},
-            "reranker_cache": {},
-        }
-
-        # Check Ollama connection
-        validator = get_model_validator()
-        try:
-            response = requests.get(
-                f"{settings.LLM_BASE_URL}/api/tags",
-                timeout=settings.OLLAMA_HEALTH_CHECK_TIMEOUT,
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                ollama_models = data.get("models", [])
-
-                health_info["ollama"] = {
-                    "status": "connected",
-                    "url": settings.LLM_BASE_URL,
-                    "models_available": len(ollama_models),
-                    "models": [
-                        {
-                            "name": model.get("name"),
-                            "size": model.get("size"),
-                            "modified_at": model.get("modified_at"),
-                        }
-                        for model in ollama_models
-                    ],
-                }
-            else:
-                health_info["ollama"] = {
-                    "status": "error",
-                    "url": settings.LLM_BASE_URL,
-                    "error": f"HTTP {response.status_code}",
-                }
-                health_info["status"] = "degraded"
-
-        except Exception as e:
-            health_info["ollama"] = {
-                "status": "disconnected",
-                "url": settings.LLM_BASE_URL,
-                "error": str(e),
-            }
-            health_info["status"] = "degraded"
-
-        # Check reranker cache
-        global _reranker_cache
-        if _reranker_cache:
-            health_info["reranker_cache"] = {
-                "cached_models": list(_reranker_cache.keys()),
-                "count": len(_reranker_cache),
-            }
-        else:
-            health_info["reranker_cache"] = {"cached_models": [], "count": 0}
-
-        # Check if HuggingFace cache directory exists and list cached models
-        try:
-            import os
-            from pathlib import Path
-
-            # Default HuggingFace cache location
-            cache_home = os.getenv("HF_HOME") or os.path.join(
-                Path.home(), ".cache", "huggingface"
-            )
-            hub_cache = os.path.join(cache_home, "hub")
-
-            if os.path.exists(hub_cache):
-                # List cached models (model directories start with "models--")
-                cached_dirs = [
-                    d for d in os.listdir(hub_cache) if d.startswith("models--")
-                ]
-                cached_model_names = [
-                    d.replace("models--", "").replace("--", "/") for d in cached_dirs
-                ]
-
-                health_info["cached_models"] = {
-                    "cache_path": hub_cache,
-                    "models": cached_model_names,
-                    "count": len(cached_model_names),
-                }
-            else:
-                health_info["cached_models"] = {
-                    "cache_path": hub_cache,
-                    "models": [],
-                    "count": 0,
-                    "note": "Cache directory does not exist yet",
-                }
-
-        except Exception as e:
-            health_info["cached_models"] = {"error": str(e)}
-
-        # Add current configuration
-        health_info["config"] = {
-            "embedding_model": settings.EMBEDDING_MODEL,
-            "reranker_model": settings.RERANKER_MODEL,
-            "llm_model": settings.LLM_MODEL,
-            "preload_on_startup": settings.PRELOAD_MODELS_ON_STARTUP,
-            "preload_models": settings.PRELOAD_MODELS,
-        }
-
-        return health_info
-
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/models/pull")
-async def pull_model(
-    model_name: str,
-    model_type: str = "embedding",
-    auto_download: bool = True,
-):
-    """
-    Pull/download a model
-
-    Args:
-        model_name: Model name to pull
-        model_type: "embedding", "reranker", or "llm"
-        auto_download: Whether to actually download (vs just check)
-
-    Returns:
-        Status of the download operation
-    """
-    try:
-        from rag.model_validation import ensure_model_available
-
-        logger.info(f"Pull request for {model_type} model: {model_name}")
-
-        # Validate model_type
-        if model_type not in ["embedding", "reranker", "llm"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid model_type '{model_type}'. Must be 'embedding', 'reranker', or 'llm'",
-            )
-
-        # Attempt to ensure model is available
-        is_available, error_msg = ensure_model_available(
-            model_name=model_name, model_type=model_type, auto_download=auto_download
-        )
-
-        if is_available:
-            return {
-                "success": True,
-                "message": f"Model '{model_name}' is available",
-                "model_name": model_name,
-                "model_type": model_type,
-                "status": "ready",
-            }
-        else:
-            # Model not available and download failed/was not attempted
-            if not auto_download:
-                return {
-                    "success": False,
-                    "message": f"Model '{model_name}' is not available",
-                    "model_name": model_name,
-                    "model_type": model_type,
-                    "status": "not_available",
-                    "error": error_msg,
-                }
-            else:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to download model '{model_name}': {error_msg}",
-                )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Pull model error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/stats/queries")
-async def get_query_stats(
-    limit: int = 100,
-    collection_id: Optional[str] = None,
-):
-    """
-    Get recent query logs and statistics
-
-    Args:
-        limit: Maximum number of logs to return (default: 100)
-        collection_id: Optional collection ID to filter logs
-
-    Returns:
-        Query logs and aggregate statistics
-    """
-    try:
-        query_logger = get_query_logger()
-
-        # Get logs
-        if collection_id:
-            logs = query_logger.get_logs_by_collection(collection_id, limit)
-        else:
-            logs = query_logger.get_recent_logs(limit)
-
-        # Get statistics
-        stats = query_logger.get_stats()
-
-        return {
-            "logs": logs,
-            "stats": stats,
-            "total_logs": len(logs),
-        }
-
-    except Exception as e:
-        logger.error(f"Query stats error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/evaluate", response_model=EvaluationResponse)
-async def evaluate(request: EvaluationRequest):
-    """
-    Evaluate RAG pipeline performance
-
-    Args:
-        request: Evaluation request with test dataset
-
-    Returns:
-        Evaluation metrics
-    """
-    try:
-        logger.info(
-            f"Evaluation request received with {len(request.test_dataset)} samples"
-        )
-
-        # Parse evaluation samples
-        samples = []
-        for item in request.test_dataset:
-            samples.append(
-                EvaluationSample(
-                    query=item["query"],
-                    relevant_chunk_ids=item.get("relevant_chunk_ids", []),
-                    expected_answer=item.get("expected_answer"),
-                    metadata=item.get("metadata", {}),
-                )
-            )
-
-        # Get or create vector store for the collection
-        if request.collection_id:
-            collection = _load_collections().get(request.collection_id)
-            embedding_dimension = (
-                collection.get("embedding_dimension") if collection else None
-            )
-            vector_store = _get_or_create_vector_store(
-                request.collection_id, embedding_dimension
-            )
-            logger.info(f"Using vector store for collection: {request.collection_id}")
-        else:
-            vector_store = _get_or_create_vector_store(
-                "default", settings.EMBEDDING_DIMENSION
-            )
-            logger.info("No collection specified, using default collection")
-
-        # Get collection-specific embedding model (cached)
-        collection_embedding_model_name = _get_collection_embedding_model(
-            request.collection_id
-        )
-        current_embedding_model = get_or_create_embedding_model(
-            model_name=collection_embedding_model_name
-        )
-
-        # Create retriever
-        if settings.USE_HYBRID_SEARCH:
-            current_retriever = HybridRetriever(
-                vector_store=vector_store,
-                embedding_model=current_embedding_model,
-                alpha=settings.HYBRID_ALPHA,
-            )
-        else:
-            current_retriever = Retriever(
-                vector_store=vector_store,
-                embedding_model=current_embedding_model,
-            )
-
-        # Create evaluator
-        evaluator = RAGEvaluator(
-            retriever=current_retriever,
-            llm_generator=llm_generator if request.evaluate_generation else None,
-        )
-
-        # Evaluate retrieval
-        retrieval_metrics = evaluator.evaluate_retrieval(
-            samples=samples,
-            k_values=request.k_values,
-        )
-
-        # Optionally evaluate generation
-        generation_metrics = None
-        if request.evaluate_generation and llm_generator:
-            logger.info("Evaluating generation quality...")
-
-            # Generate answers for evaluation
-            generated_answers = []
-            contexts = []
-
-            for sample in samples:
-                # Retrieve context
-                chunks_with_scores = current_retriever.retrieve(
-                    sample.query, top_k=settings.FINAL_TOP_K
-                )
-
-                # Generate answer
-                answer = llm_generator.generate_rag_response(
-                    query=sample.query,
-                    chunks_with_scores=chunks_with_scores,
-                )
-
-                generated_answers.append(answer)
-                contexts.append([chunk for chunk, _ in chunks_with_scores])
-
-            # Evaluate
-            generation_metrics = evaluator.evaluate_generation(
-                samples=samples,
-                generated_answers=generated_answers,
-                contexts=contexts,
-            )
-
-        # Return results
-        from dataclasses import asdict
-
-        return EvaluationResponse(
-            retrieval_metrics=asdict(retrieval_metrics),
-            generation_metrics=asdict(generation_metrics)
-            if generation_metrics
-            else None,
-            sample_count=len(samples),
-            timestamp=datetime.utcnow().isoformat(),
-        )
-
-    except Exception as e:
-        logger.error(f"Evaluation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Configuration Management
-# ============================================================================
-
-
-@app.get("/config/env")
-async def get_env_config():
-    """
-    Get current runtime configuration (settings + .env overrides)
-
-    Returns:
-        Dictionary of effective settings grouped by category
-    """
-    try:
-        # Get actual runtime settings
-        config = settings.model_dump()
-
-        # Structure it to match the frontend's expected categories
-        # This maps the flat settings structure to the categorized structure
-        structured_config = {
-            "server": {
-                "HOST": config.get("HOST"),
-                "PORT": config.get("PORT"),
-                "LOG_LEVEL": config.get("LOG_LEVEL"),
-            },
-            "paths": {
-                "DATA_DIR": config.get("DATA_DIR"),
-                "CORPUS_DIR": config.get("CORPUS_DIR"),
-                "INDEX_DIR": config.get("INDEX_DIR"),
-            },
-            "vector_store": {
-                "VECTOR_STORE_TYPE": config.get("VECTOR_STORE_TYPE"),
-                "LANCEDB_URI": config.get("LANCEDB_URI"),
-                "CHROMA_HOST": config.get("CHROMA_HOST"),
-                "CHROMA_PORT": config.get("CHROMA_PORT"),
-            },
-            "embedding": {
-                "EMBEDDING_MODEL": config.get("EMBEDDING_MODEL"),
-                "EMBEDDING_DIMENSION": config.get("EMBEDDING_DIMENSION"),
-                "EMBEDDING_DEVICE": config.get("EMBEDDING_DEVICE"),
-                "EMBEDDING_BATCH_SIZE": config.get("EMBEDDING_BATCH_SIZE"),
-                "NORMALIZE_EMBEDDINGS": config.get("NORMALIZE_EMBEDDINGS"),
-            },
-            "llm": {
-                "LLM_BASE_URL": config.get("LLM_BASE_URL"),
-                "LLM_MODEL": config.get("LLM_MODEL"),
-                "LLM_TEMPERATURE": config.get("LLM_TEMPERATURE"),
-                "LLM_MAX_TOKENS": config.get("LLM_MAX_TOKENS"),
-            },
-            "chunking": {
-                "CHUNK_SIZE": config.get("CHUNK_SIZE"),
-                "CHUNK_OVERLAP": config.get("CHUNK_OVERLAP"),
-                "CHUNKING_STRATEGY": config.get("CHUNKING_STRATEGY"),
-            },
-            "retrieval": {
-                "TOP_K": config.get("TOP_K"),
-                "MIN_SIMILARITY_SCORE": config.get("MIN_SIMILARITY_SCORE"),
-                "USE_HYBRID_SEARCH": config.get("USE_HYBRID_SEARCH"),
-                "HYBRID_ALPHA": config.get("HYBRID_ALPHA"),
-            },
-            "reranking": {
-                "USE_RERANKING": config.get("USE_RERANKING"),
-                "RERANKER_MODEL": config.get("RERANKER_MODEL"),
-                "RERANKER_TOP_K": config.get("RERANKER_TOP_K"),
-            },
-            "compression": {
-                "USE_COMPRESSION": config.get("USE_COMPRESSION"),
-                "MAX_CONTEXT_TOKENS": config.get("MAX_CONTEXT_TOKENS"),
-                "COMPRESSION_RATIO": config.get("COMPRESSION_RATIO"),
-            },
-            "other": {
-                # Fallback for any other keys not mapped
-                k: v
-                for k, v in config.items()
-                if not any(
-                    k in sub
-                    for sub in [
-                        "HOST",
-                        "PORT",
-                        "LOG_LEVEL",
-                        "DATA_DIR",
-                        "CORPUS_DIR",
-                        "INDEX_DIR",
-                        "VECTOR_STORE_TYPE",
-                        "LANCEDB_URI",
-                        "CHROMA_HOST",
-                        "CHROMA_PORT",
-                        "EMBEDDING_MODEL",
-                        "EMBEDDING_DIMENSION",
-                        "EMBEDDING_DEVICE",
-                        "EMBEDDING_BATCH_SIZE",
-                        "NORMALIZE_EMBEDDINGS",
-                        "LLM_BASE_URL",
-                        "LLM_MODEL",
-                        "LLM_TEMPERATURE",
-                        "LLM_MAX_TOKENS",
-                        "CHUNK_SIZE",
-                        "CHUNK_OVERLAP",
-                        "CHUNKING_STRATEGY",
-                        "TOP_K",
-                        "MIN_SIMILARITY_SCORE",
-                        "USE_HYBRID_SEARCH",
-                        "HYBRID_ALPHA",
-                        "USE_RERANKING",
-                        "RERANKER_MODEL",
-                        "RERANKER_TOP_K",
-                        "USE_COMPRESSION",
-                        "MAX_CONTEXT_TOKENS",
-                        "COMPRESSION_RATIO",
-                    ]
-                )
-            },
-        }
-
-        # Determine current .env path for information purposes
-        env_path = Path(__file__).parent.parent / ".env"
-
-        return {
-            "config": structured_config,
-            "flat_config": config,  # Also return flat config for easier frontend mapping
-            "file_path": str(env_path) if env_path.exists() else "Using defaults",
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to read config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/config/env")
-async def update_env_config(updates: Dict[str, Dict[str, str]]):
-    """
-    Update .env configuration
-
-    NOTE: This endpoint is suitable for local/internal use only.
-    For public deployment, add authentication and authorization.
-
-    Args:
-        updates: Dictionary of category -> {key: value} updates
-
-    Returns:
-        Success message
-    """
-    try:
-        env_path = Path(__file__).parent.parent / ".env"
-
-        if not env_path.exists():
-            raise HTTPException(status_code=404, detail=".env file not found")
-
-        # Read current file
-        with open(env_path, "r") as f:
-            lines = f.readlines()
-
-        # Build flat update dict
-        flat_updates = {}
-        for category_updates in updates.values():
-            flat_updates.update(category_updates)
-
-        # Update lines
-        new_lines = []
-        for line in lines:
-            stripped = line.strip()
-
-            # Keep comments and empty lines
-            if stripped.startswith("#") or not stripped:
-                new_lines.append(line)
-            elif "=" in stripped:
-                key = stripped.split("=", 1)[0].strip()
-
-                # Update if key is in updates
-                if key in flat_updates:
-                    # Preserve any inline comment
-                    if "#" in stripped:
-                        comment = stripped.split("#", 1)[1]
-                        new_lines.append(f"{key}={flat_updates[key]}  # {comment}\n")
-                    else:
-                        new_lines.append(f"{key}={flat_updates[key]}\n")
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-
-        # Write back to file
-        with open(env_path, "w") as f:
-            f.writelines(new_lines)
-
-        logger.info(f"Updated .env configuration with {len(flat_updates)} changes")
-
-        return {
-            "success": True,
-            "message": f"Updated {len(flat_updates)} configuration values",
-            "note": "Restart the backend for changes to take effect",
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to update .env config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

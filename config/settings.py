@@ -3,8 +3,8 @@ Configuration settings for RAG Pipeline - MINIMAL VERSION
 Only infrastructure settings that cannot be changed per API request
 """
 
-from pydantic_settings import BaseSettings
-from typing import List, Optional
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
 import os
 
 
@@ -75,10 +75,10 @@ class Settings(BaseSettings):
     # =============================================================================
     USE_CACHE: bool = False
     CACHE_TTL: int = 3600
-    CACHE_DIR: str = "./data/cache"
 
-    # Note: System uses DiskCache by default (no Redis required)
-    # To enable Redis later, add CACHE_TYPE and REDIS_URL (see REDIS-CACHE-STATUS.md)
+    # Redis support (optional, falls back to DiskCache)
+    CACHE_TYPE: str = "disk"
+    REDIS_URL: str = "redis://localhost:6379"
 
     # =============================================================================
     # RETRIEVAL
@@ -183,12 +183,13 @@ class Settings(BaseSettings):
     USE_GRAPH_RAG_PERSISTENCE: bool = True
 
     # =============================================================================
-    # HELPER METHODS
+    # QUERY OBSERVABILITY
     # =============================================================================
+    ENABLE_QUERY_LOGGING: bool = True
+    MAX_QUERY_LOGS: int = 1000
+    QUERY_LOG_PATH: str = "./data/query_logs.jsonl"
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
 
 # Create settings instance

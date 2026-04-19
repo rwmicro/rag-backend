@@ -9,7 +9,7 @@ import numpy as np
 from loguru import logger
 import json
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .chunking import Chunk
 
@@ -52,7 +52,7 @@ class EvaluationResult:
     retrieval_metrics: RetrievalMetrics
     generation_metrics: Optional[GenerationMetrics] = None
     sample_count: int = 0
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

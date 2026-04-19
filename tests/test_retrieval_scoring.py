@@ -3,9 +3,9 @@ import pytest
 from unittest.mock import MagicMock
 import numpy as np
 
-from backend.rag.retrieval import HybridRetriever, normalize_minmax, normalize_zscore, reciprocal_rank_fusion
-from backend.rag.chunking import Chunk
-from backend.config.settings import settings
+from rag.retrieval import HybridRetriever, normalize_minmax, normalize_zscore, reciprocal_rank_fusion
+from rag.chunking import Chunk
+from config.settings import settings
 
 class TestRetrievalScoring:
     

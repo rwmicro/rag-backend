@@ -5,7 +5,7 @@ Provides structured logging for RAG pipeline queries
 
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import json
 import os
@@ -201,7 +201,7 @@ def create_query_log(query: str, collection_id: Optional[str] = None) -> QueryLo
     """
     return QueryLog(
         query_id=str(uuid.uuid4()),
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         query=query,
         collection_id=collection_id,
     )

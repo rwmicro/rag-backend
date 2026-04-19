@@ -77,3 +77,21 @@ class JobStore:
         if d.get("result"):
             d["result"] = json.loads(d["result"])
         return d
+
+    def mark_orphans_failed(self) -> int:
+        """Mark jobs left in queued/running state (from a previous crashed process) as failed.
+
+        Returns number of jobs updated.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self._conn().execute(
+            """
+            UPDATE ingest_jobs
+            SET status='failed',
+                error='orphaned: server restarted during job',
+                updated_at=?
+            WHERE status IN ('queued', 'running')
+            """,
+            (now,),
+        )
+        return cur.rowcount
