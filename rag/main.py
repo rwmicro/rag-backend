@@ -1199,6 +1199,10 @@ async def _execute_rag_pipeline(
                 alpha=request.graph_alpha,
             )
             logger.info(f"Graph RAG returned {len(chunks_with_scores)} enhanced chunks")
+
+            # Capture traversal trace so downstream endpoints can surface it
+            if collection_graph_rag.last_traversal is not None:
+                query_log.metadata["graph_traversal"] = collection_graph_rag.last_traversal
         except Exception:
             logger.exception("Graph RAG failed, continuing without graph enhancement")
             query_log.metadata["graph_rag_error"] = True
@@ -1621,6 +1625,11 @@ async def query_stream(request: QueryRequest):
 
                 # Emit sources as JSON event
                 yield f"\n\ndata: {json.dumps({'type': 'sources', 'sources': sources_data})}\n\n"
+
+            # Emit graph traversal metadata (only populated when Graph RAG ran)
+            graph_traversal = query_log.metadata.get("graph_traversal")
+            if graph_traversal:
+                yield f"data: {json.dumps({'type': 'graph_traversal', 'traversal': graph_traversal})}\n\n"
 
             # Emit final status: completed
             yield f"data: {json.dumps({'type': 'status', 'status': 'completed', 'message': 'Response generated successfully'})}\n\n"

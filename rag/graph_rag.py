@@ -331,6 +331,9 @@ class GraphRAG:
         self.chunk_to_entities: Dict[str, List[str]] = defaultdict(list)
         self.entity_embeddings: Dict[str, np.ndarray] = {}
 
+        # Trace of the most recent retrieve_with_graph call (populated per query)
+        self.last_traversal: Optional[Dict[str, Any]] = None
+
         # spaCy NER pipeline (lazy-loaded)
         self.nlp = None
 
@@ -644,6 +647,9 @@ class GraphRAG:
         Returns:
             Reranked chunks with combined scores
         """
+        # Reset traversal trace for this call
+        self.last_traversal = None
+
         if not chunks_with_scores:
             return []
 
@@ -663,6 +669,13 @@ class GraphRAG:
 
         if not seed_entities:
             logger.warning("No entities found in initial results, returning vector results")
+            self.last_traversal = {
+                "seed": [],
+                "expanded": [],
+                "edges": [],
+                "expansion_depth": expansion_depth,
+                "alpha": alpha,
+            }
             return chunks_with_scores[:top_k]
 
         logger.info(f"Seed entities: {len(seed_entities)}")
@@ -732,8 +745,81 @@ class GraphRAG:
             if chunk_id in chunk_map
         ]
 
+        # Build traversal trace for observability/UI
+        self.last_traversal = self._build_traversal_trace(
+            seed_entities=seed_entities,
+            expanded_entities=expanded_entities,
+            expansion_depth=expansion_depth,
+            alpha=alpha,
+        )
+
         logger.info(f"Graph-enhanced retrieval: {len(results)} results")
         return results
+
+    def _build_traversal_trace(
+        self,
+        seed_entities: Set[str],
+        expanded_entities: Set[str],
+        expansion_depth: int,
+        alpha: float,
+        max_entities: int = 40,
+        max_edges: int = 80,
+    ) -> Dict[str, Any]:
+        """Serialize the entities/edges traversed by the latest Graph RAG call."""
+
+        def entity_payload(name: str, is_seed: bool) -> Dict[str, Any]:
+            entity = self.entities.get(name)
+            node_data = self.graph.nodes.get(name, {}) if name in self.graph else {}
+            return {
+                "name": name,
+                "entity_type": entity.entity_type if entity else node_data.get("entity_type", "UNKNOWN"),
+                "mentions": len(entity.mentions) if entity else 0,
+                "importance": float(node_data.get("importance", 0.0)),
+                "is_seed": is_seed,
+            }
+
+        seed_payload = [entity_payload(name, True) for name in list(seed_entities)[:max_entities]]
+        only_expanded = [e for e in expanded_entities if e not in seed_entities]
+        expanded_payload = [entity_payload(name, False) for name in only_expanded[:max_entities]]
+
+        # Edges between any pair of traversed entities
+        traversed = set(seed_entities) | set(expanded_entities)
+        edges_payload: List[Dict[str, Any]] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+        for source in traversed:
+            if source not in self.graph:
+                continue
+            for target in self.graph.neighbors(source):
+                if target not in traversed:
+                    continue
+                pair = tuple(sorted((source, target)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                edge_data = self.graph.get_edge_data(source, target, default={})
+                edges_payload.append({
+                    "source": source,
+                    "target": target,
+                    "type": edge_data.get("relation_type") or edge_data.get("type", "RELATED_TO"),
+                    "weight": float(edge_data.get("weight", 1.0)),
+                })
+                if len(edges_payload) >= max_edges:
+                    break
+            if len(edges_payload) >= max_edges:
+                break
+
+        return {
+            "seed": seed_payload,
+            "expanded": expanded_payload,
+            "edges": edges_payload,
+            "expansion_depth": expansion_depth,
+            "alpha": alpha,
+            "totals": {
+                "seed_count": len(seed_entities),
+                "expanded_count": len(only_expanded),
+                "edge_count": len(edges_payload),
+            },
+        }
 
     def _expand_entities(
         self,
