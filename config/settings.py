@@ -121,6 +121,12 @@ class Settings(BaseSettings):
     RETRIEVAL_CONFIDENCE_MEDIUM: float = 0.5
     RETRIEVAL_CONFIDENCE_MINIMUM: float = 0.2
 
+    # Corrective RAG: rewrite the query and retry once when confidence is low.
+    ENABLE_CORRECTIVE_RAG: bool = True
+    CORRECTIVE_MAX_ATTEMPTS: int = 1  # retries beyond the initial attempt
+    CORRECTIVE_TRIGGER_LEVEL: str = "low"  # "low" | "very_low" | "medium"
+    CORRECTIVE_MERGE_METHOD: str = "max"  # "max" | "rrf"
+
     # =============================================================================
     # MODEL PRELOADING
     # =============================================================================

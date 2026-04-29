@@ -576,7 +576,7 @@ async def lifespan(_app: FastAPI):
         )
         logger.info("✓ Query classifier initialized")
 
-    if settings.ENABLE_FALLBACK_STRATEGIES:
+    if settings.ENABLE_FALLBACK_STRATEGIES or settings.ENABLE_CORRECTIVE_RAG:
         confidence_evaluator = ConfidenceEvaluator(
             high_threshold=settings.RETRIEVAL_CONFIDENCE_HIGH,
             medium_threshold=settings.RETRIEVAL_CONFIDENCE_MEDIUM,
@@ -1106,6 +1106,53 @@ async def _execute_rag_pipeline(
 
         # Record retrieval metrics
         query_log.retrieval.initial_candidates = len(chunks_with_scores)
+
+        # Corrective RAG: grade the result set and retry with a rewritten query
+        # if confidence is low. Only runs in the standard branch where
+        # `current_retriever` is well-defined; multilingual branch keeps its
+        # own pipeline.
+        if (
+            request.enable_confidence_evaluation
+            and settings.ENABLE_CORRECTIVE_RAG
+            and confidence_evaluator is not None
+        ):
+            try:
+                from rag.corrective import CorrectiveLoop
+
+                _metadata_filter = request.metadata_filter
+                _retriever = current_retriever
+
+                def _retry_retrieve(rewritten: str):
+                    return _retriever.retrieve(
+                        query=rewritten,
+                        top_k=initial_top_k,
+                        metadata_filter=_metadata_filter,
+                    )
+
+                loop = CorrectiveLoop(
+                    evaluator=confidence_evaluator,
+                    llm_generator=llm_generator,
+                    max_attempts=settings.CORRECTIVE_MAX_ATTEMPTS,
+                    trigger_level=settings.CORRECTIVE_TRIGGER_LEVEL,
+                    merge_method=settings.CORRECTIVE_MERGE_METHOD,
+                )
+                chunks_with_scores, corrective_trace = loop.run(
+                    query=contextualized_query,
+                    initial_results=chunks_with_scores,
+                    retry_retrieve=_retry_retrieve,
+                    top_k=initial_top_k,
+                )
+                query_log.metadata["corrective_rag"] = corrective_trace.to_dict()
+                if corrective_trace.triggered:
+                    logger.info(
+                        f"Corrective loop: strategy={corrective_trace.final_strategy}, "
+                        f"attempts={len(corrective_trace.attempts)}"
+                    )
+                # Re-record candidate count after a possible merge
+                query_log.retrieval.initial_candidates = len(chunks_with_scores)
+            except Exception:
+                logger.exception("Corrective RAG loop failed, continuing with initial results")
+                query_log.metadata["corrective_rag_error"] = True
 
     if not chunks_with_scores:
         query_log.retrieval.final_candidates = 0

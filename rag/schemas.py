@@ -96,7 +96,11 @@ class QueryRequest(BaseModel):
         None, description="Minimum verification score (0-1)"
     )
     enable_confidence_evaluation: bool = Field(
-        False, description="Enable confidence evaluation with fallback strategies"
+        True,
+        description=(
+            "Grade retrieval confidence. When the backend has corrective RAG "
+            "enabled, low confidence triggers a query rewrite + retry."
+        ),
     )
     enable_feedback_logging: bool = Field(
         True, description="Enable feedback and performance logging"
