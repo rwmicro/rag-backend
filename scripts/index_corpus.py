@@ -5,13 +5,11 @@ Ingests all documents from corpus directory and builds vector index
 """
 
 import sys
-import os
 from pathlib import Path
 import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
 from rich.table import Table
-from loguru import logger
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -88,7 +86,7 @@ def main(
     if not Path(corpus_dir).exists():
         console.print(f"[bold red]❌ Error:[/bold red] Corpus directory not found: {corpus_dir}")
         console.print(f"\nCreate it with: [cyan]mkdir -p {corpus_dir}[/cyan]")
-        console.print(f"Then add your PDF and Markdown files to this directory.")
+        console.print("Then add your PDF and Markdown files to this directory.")
         return
 
     # Display configuration
@@ -138,7 +136,7 @@ def main(
 
     # Ingest documents
     console.print("\n[bold]Step 1: Document Ingestion[/bold]")
-    with console.status("[bold green]Reading documents...") as status:
+    with console.status("[bold green]Reading documents..."):
         documents = ingestor.ingest_directory(
             directory=corpus_dir,
             recursive=recursive,
@@ -212,7 +210,7 @@ def main(
     # Add to vector store
     console.print("\n[bold]Step 4: Vector Store Indexing[/bold]")
 
-    with console.status("[bold green]Adding chunks to vector store...") as status:
+    with console.status("[bold green]Adding chunks to vector store..."):
         vector_store.add_chunks(all_chunks)
 
     console.print(f"[green]✓[/green] Indexed {len(all_chunks)} chunks")

@@ -21,7 +21,6 @@ from rag import (
     create_vector_store,
     HybridRetriever,
     Reranker,
-    ContextCompressor,
     LLMGenerator,
 )
 
@@ -57,7 +56,7 @@ def main(query: str, top_k: int, use_reranking: bool, stream: bool):
     console.print("\n[bold cyan]🔍 RAG Query Tester[/bold cyan]\n")
 
     # Initialize components
-    with console.status("[bold green]Initializing components...") as status:
+    with console.status("[bold green]Initializing components..."):
         # Embedding model
         console.print("Loading embedding model...")
         embedding_model = create_embedding_model()
@@ -96,7 +95,7 @@ def main(query: str, top_k: int, use_reranking: bool, stream: bool):
 
     # Step 1: Retrieval
     console.print("\n[bold]Step 1: Retrieving relevant chunks[/bold]")
-    with console.status("[bold green]Searching...") as status:
+    with console.status("[bold green]Searching..."):
         chunks_with_scores = retriever.retrieve(
             query=query,
             top_k=top_k * 2 if use_reranking else top_k,
@@ -111,7 +110,7 @@ def main(query: str, top_k: int, use_reranking: bool, stream: bool):
     # Step 2: Reranking
     if use_reranking and reranker:
         console.print("\n[bold]Step 2: Reranking results[/bold]")
-        with console.status("[bold green]Reranking...") as status:
+        with console.status("[bold green]Reranking..."):
             chunks_with_scores = reranker.rerank(
                 query=query,
                 chunks_with_scores=chunks_with_scores,
@@ -160,7 +159,7 @@ def main(query: str, top_k: int, use_reranking: bool, stream: bool):
 
     else:
         # Non-streaming response
-        with console.status("[bold green]Generating...") as status:
+        with console.status("[bold green]Generating..."):
             response = llm.generate_rag_response(
                 query=query,
                 chunks_with_scores=chunks_with_scores,

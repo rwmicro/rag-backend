@@ -262,7 +262,7 @@ Passage:"""
         Returns:
             Fused results
         """
-        logger.info(f"Hybrid HyDE+Direct retrieval")
+        logger.info("Hybrid HyDE+Direct retrieval")
 
         # HyDE search
         hyde_results = self.retrieve(

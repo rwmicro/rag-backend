@@ -322,7 +322,7 @@ def main():
             results.append((name, "✓ PASS" if result else "✗ FAIL", "green" if result else "red"))
         except Exception as e:
             console.print(f"\n[red]Exception in {name}: {e}[/red]")
-            results.append((name, f"✗ ERROR", "red"))
+            results.append((name, "✗ ERROR", "red"))
 
     # Summary
     console.print("\n[bold]Test Summary[/bold]\n")

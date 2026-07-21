@@ -3,7 +3,7 @@ Query Router Module
 Automatically selects optimal retrieval strategy based on query characteristics
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 import re
@@ -143,7 +143,7 @@ class QueryRouter:
 
         # Check for multi-hop reasoning
         if self._is_multi_hop(query, query_lower):
-            logger.info(f"Classified as multi_hop query")
+            logger.info("Classified as multi_hop query")
             return QueryType.MULTI_HOP, RetrievalStrategy(
                 use_hybrid_search=True,
                 use_graph_rag=True,
@@ -153,7 +153,7 @@ class QueryRouter:
 
         # Check for entity-centric queries
         if self._is_entity_centric(query):
-            logger.info(f"Classified as entity_centric query")
+            logger.info("Classified as entity_centric query")
             return QueryType.ENTITY_CENTRIC, RetrievalStrategy(
                 use_hybrid_search=True,
                 use_graph_rag=True,
@@ -163,7 +163,7 @@ class QueryRouter:
 
         # Check for exploratory queries
         if self._is_exploratory(query_lower):
-            logger.info(f"Classified as exploratory query")
+            logger.info("Classified as exploratory query")
             return QueryType.EXPLORATORY, RetrievalStrategy(
                 use_hybrid_search=True,
                 use_multi_query=True,
@@ -173,7 +173,7 @@ class QueryRouter:
 
         # Check for vague or sparse queries
         if self._is_vague_or_sparse(query, query_lower, query_length):
-            logger.info(f"Classified as vague_or_sparse query")
+            logger.info("Classified as vague_or_sparse query")
             return QueryType.VAGUE_OR_SPARSE, RetrievalStrategy(
                 use_hybrid_search=True,
                 use_hyde=True,
@@ -184,14 +184,14 @@ class QueryRouter:
 
         # Check for complex factual queries
         if self._is_factual_complex(query, query_lower, query_length):
-            logger.info(f"Classified as factual_complex query")
+            logger.info("Classified as factual_complex query")
             return QueryType.FACTUAL_COMPLEX, RetrievalStrategy(
                 use_hybrid_search=True,
                 use_reranking=True,
             )
 
         # Default: simple factual query (fast path)
-        logger.info(f"Classified as factual_simple query (default)")
+        logger.info("Classified as factual_simple query (default)")
         return QueryType.FACTUAL_SIMPLE, RetrievalStrategy(
             use_hybrid_search=True,
             use_reranking=False,  # Fast path - skip reranking

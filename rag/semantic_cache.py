@@ -5,7 +5,7 @@ Caches query results based on semantic similarity rather than exact match
 
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import time

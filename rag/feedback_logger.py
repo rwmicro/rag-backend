@@ -8,7 +8,7 @@ Tracks RAG performance metrics, user feedback, and system events for:
 4. A/B testing and experimentation
 """
 
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum

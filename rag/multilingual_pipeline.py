@@ -24,7 +24,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from loguru import logger
 
 from .chunking import Chunk
-from .embeddings import MultilingualEmbeddingModel, create_embedding_model
+from .embeddings import create_embedding_model
 from .retrieval import MultilingualBM25Index, MultilingualTokenizer
 from .query_classifier import MultilingualQueryClassifier
 from .hyde import MultilingualHyDE

@@ -3,12 +3,11 @@ LLM Generation Module
 Handles interaction with local LLMs (Ollama, vLLM, LM Studio)
 """
 
-from typing import List, Tuple, Optional, AsyncIterator, Dict, Any
+from typing import List, Tuple, Optional, AsyncIterator
 import httpx
 from loguru import logger
 
 from .chunking import Chunk
-from config.settings import settings
 from .llm_provider import create_llm_provider, BaseLLMProvider
 
 

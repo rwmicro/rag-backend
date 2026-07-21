@@ -368,7 +368,7 @@ class RAGEvaluator:
             # Track length
             lengths.append(len(answer.split()))
 
-        logger.info(f"Generation evaluation complete")
+        logger.info("Generation evaluation complete")
 
         return GenerationMetrics(
             relevance_score=np.mean(relevance_scores),
@@ -563,7 +563,7 @@ Generate {num_questions} questions (one per line):"""
                 metadata={"strategy": strategy_name, "config": strategy_config}
             )
 
-        logger.info(f"Strategy comparison complete")
+        logger.info("Strategy comparison complete")
         return results
 
     def export_results(

@@ -3,14 +3,13 @@ Model Validation Utility
 Validates model availability and compatibility before use
 """
 
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict
 import requests
 import subprocess
-import os
 from loguru import logger
 
 from config.settings import settings
-from .model_registry import get_model_info, get_model_dimension
+from .model_registry import get_model_info
 
 
 class ModelValidator:
@@ -438,14 +437,14 @@ def _download_huggingface_model(model_name: str, model_type: str) -> Tuple[bool,
         if model_type == "embedding":
             from sentence_transformers import SentenceTransformer
             # This will download the model if not cached
-            model = SentenceTransformer(model_name)
+            SentenceTransformer(model_name)
             logger.info(f"✓ Downloaded embedding model: {model_name}")
             return True, None
 
         elif model_type == "reranker":
             from sentence_transformers import CrossEncoder
             # This will download the model if not cached
-            model = CrossEncoder(model_name)
+            CrossEncoder(model_name)
             logger.info(f"✓ Downloaded reranker model: {model_name}")
             return True, None
 
@@ -498,13 +497,13 @@ def preload_models(model_names: Optional[List[str]] = None) -> Dict[str, bool]:
 
                 # Try as embedding model first
                 try:
-                    model = SentenceTransformer(model_name)
+                    SentenceTransformer(model_name)
                     logger.info(f"✓ Preloaded embedding model: {model_name}")
                     results[model_name] = True
-                except:
+                except Exception:
                     # Try as reranker
                     try:
-                        model = CrossEncoder(model_name)
+                        CrossEncoder(model_name)
                         logger.info(f"✓ Preloaded reranker model: {model_name}")
                         results[model_name] = True
                     except Exception as e:
