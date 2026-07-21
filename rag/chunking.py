@@ -360,6 +360,60 @@ class MarkdownChunker(BaseChunker):
         return result
 
 
+# Extensions the "smart" strategy recognises.
+_MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".go", ".rs", ".cpp", ".c", ".h",
+}
+
+
+def resolve_chunking_strategy(
+    strategy: str,
+    filename: Optional[str] = None,
+    content: str = "",
+) -> str:
+    """Resolve the "smart" pseudo-strategy to a concrete one.
+
+    "smart" is not a chunker: it is a request to pick one from the document
+    itself, so it has to be resolved before create_chunker() sees it. Every
+    ingest path must call this, otherwise create_chunker rejects "smart" as an
+    unknown strategy.
+
+    Args:
+        strategy: Requested strategy, possibly "smart"
+        filename: Source filename, used for its extension (may be absent, e.g. URLs)
+        content: Parsed document text, inspected for Markdown headers
+
+    Returns:
+        A strategy name create_chunker accepts.
+    """
+    if strategy != "smart":
+        return strategy
+
+    ext = ""
+    if filename and "." in filename:
+        ext = filename[filename.rfind("."):].lower()
+
+    if ext in _MARKDOWN_EXTENSIONS:
+        # Markdown chunking keys off headers; without any, it degenerates to
+        # one big section, so fall back to semantic.
+        if re.search(r"^#+\s", content, re.MULTILINE):
+            resolved = "markdown"
+        else:
+            resolved = "semantic"
+    elif ext in _CODE_EXTENSIONS:
+        resolved = "recursive"
+    else:
+        resolved = "semantic"
+
+    logger.info(
+        f"Smart chunking: selected '{resolved}' strategy"
+        f"{f' for {filename}' if filename else ''}"
+    )
+    return resolved
+
+
 def create_chunker(
     strategy: str = "semantic",
     chunk_size: int = 1000,

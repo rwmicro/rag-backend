@@ -91,10 +91,9 @@ Fragments shorter than `min_chunk_size` (default `max(50, chunk_size // 2)`
 tokens) are dropped, so a small `chunk_size` on short documents can legitimately
 yield no chunks.
 
-Strategies are `semantic`, `recursive` and `markdown`. `smart` — which picks one
-from the file type and whether the document has headers — is only resolved by
-this endpoint; the async, folder, URL and directory routes pass the value
-straight through and reject it.
+Strategies are `semantic`, `recursive`, `markdown`, or `smart` — which picks one
+per document from the file extension and, for Markdown, whether it actually has
+headers. `smart` works on every ingest route.
 
 **Single file (async — recommended for large files)**
 ```bash

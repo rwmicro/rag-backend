@@ -21,7 +21,6 @@ import gc
 import asyncio
 import threading
 import torch
-import re
 import pickle
 import numpy as np
 
@@ -52,7 +51,7 @@ from rag.observability import (
 )
 from rag.query_router import create_query_router
 from rag.document_summary import get_document_summarizer
-from rag.chunking import apply_contextual_embeddings
+from rag.chunking import apply_contextual_embeddings, resolve_chunking_strategy
 from rag.validation import (
     validate_file_upload,
     validate_query_text,
@@ -1835,45 +1834,9 @@ async def ingest_file(
             # Bound to a separate name: assigning to the captured form
             # parameter would make it local to _process and raise
             # UnboundLocalError on the read below.
-            effective_strategy = chunking_strategy
-            # Implement Smart Chunking Strategy
-            if effective_strategy == "smart":
-                ext = os.path.splitext(file.filename)[1].lower()
-                if ext in [".md", ".markdown"]:
-                    # Check for headers to decide between Markdown and Semantic
-                    has_headers = bool(re.search(r"^#+\s", document.content, re.MULTILINE))
-                    if has_headers:
-                        effective_strategy = "markdown"
-                        logger.info(
-                            f"Smart chunking: Selected 'markdown' strategy for {file.filename} (headers found)"
-                        )
-                    else:
-                        effective_strategy = "semantic"
-                        logger.info(
-                            f"Smart chunking: Selected 'semantic' strategy for {file.filename} (no headers found)"
-                        )
-                elif ext in [
-                    ".py",
-                    ".js",
-                    ".ts",
-                    ".tsx",
-                    ".jsx",
-                    ".java",
-                    ".go",
-                    ".rs",
-                    ".cpp",
-                    ".c",
-                    ".h",
-                ]:
-                    effective_strategy = "recursive"
-                    logger.info(
-                        f"Smart chunking: Selected 'recursive' strategy for code file {file.filename}"
-                    )
-                else:
-                    effective_strategy = "semantic"
-                    logger.info(
-                        f"Smart chunking: Selected 'semantic' strategy for {file.filename}"
-                    )
+            effective_strategy = resolve_chunking_strategy(
+                chunking_strategy, file.filename, document.content
+            )
 
             # Create chunker
             chunker = create_chunker(
@@ -2140,7 +2103,10 @@ async def ingest_file_async(
             _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.2)
 
             chunker = create_chunker(
-                strategy=chunking_strategy, chunk_size=chunk_size,
+                strategy=resolve_chunking_strategy(
+                    chunking_strategy, filename, document.content
+                ),
+                chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap, min_chunk_size=settings.MIN_CHUNK_SIZE,
             )
             chunks = chunker.chunk_document(content=document.content, metadata=document.metadata)
@@ -2289,7 +2255,11 @@ def ingest_folder(
                     document = ingestor.ingest_from_buffer(content=content, filename=file_path.name, doc_type=doc_type)
 
                     chunker = create_chunker(
-                        strategy=request.chunking_strategy,
+                        strategy=resolve_chunking_strategy(
+                            request.chunking_strategy,
+                            file_path.name,
+                            document.content,
+                        ),
                         chunk_size=request.chunk_size,
                         chunk_overlap=request.chunk_overlap,
                         min_chunk_size=settings.MIN_CHUNK_SIZE,
@@ -2388,9 +2358,14 @@ def ingest_url(
         # Ingest URL
         document = ingestor.ingest_url(url)
 
-        # Create chunker
+        # Create chunker. A URL rarely carries a usable extension, so "smart"
+        # will normally resolve to semantic here.
         chunker = create_chunker(
-            strategy=chunking_strategy,
+            strategy=resolve_chunking_strategy(
+                chunking_strategy,
+                document.metadata.get("filename") or url,
+                document.content,
+            ),
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             min_chunk_size=settings.MIN_CHUNK_SIZE,
@@ -2531,20 +2506,25 @@ def ingest_directory(
                 recursive=request.recursive,
             )
 
-            # Create chunker
-            chunker = create_chunker(
-                strategy=request.chunking_strategy,
-                chunk_size=request.chunk_size,
-                chunk_overlap=request.chunk_overlap,
-                min_chunk_size=settings.MIN_CHUNK_SIZE,
-            )
-
             # Get or create embedding model (cached)
             embedding_model_to_use = get_or_create_embedding_model()
 
             # Process each document
             total_chunks = 0
             for doc in documents:
+                # Built per document: "smart" resolves from each file's own
+                # extension and content, so one shared chunker would not do.
+                chunker = create_chunker(
+                    strategy=resolve_chunking_strategy(
+                        request.chunking_strategy,
+                        doc.metadata.get("filename"),
+                        doc.content,
+                    ),
+                    chunk_size=request.chunk_size,
+                    chunk_overlap=request.chunk_overlap,
+                    min_chunk_size=settings.MIN_CHUNK_SIZE,
+                )
+
                 # Chunk
                 chunks = chunker.chunk_document(doc.content, doc.metadata)
 

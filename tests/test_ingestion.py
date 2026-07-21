@@ -15,9 +15,61 @@ from rag.chunking import (
     RecursiveChunker,
     MarkdownChunker,
     create_chunker,
+    resolve_chunking_strategy,
     apply_contextual_embeddings,
     Chunk
 )
+
+
+class TestSmartStrategyResolution:
+    """`smart` is a request to pick a strategy, not a chunker itself."""
+
+    def test_concrete_strategies_pass_through(self):
+        for strategy in ("semantic", "recursive", "markdown"):
+            assert resolve_chunking_strategy(strategy, "a.md", "# H") == strategy
+
+    def test_markdown_with_headers(self):
+        assert resolve_chunking_strategy(
+            "smart", "doc.md", "# Title\n\nBody"
+        ) == "markdown"
+
+    def test_markdown_without_headers_falls_back_to_semantic(self):
+        """Markdown chunking keys off headers; without any it has nothing to split on."""
+        assert resolve_chunking_strategy(
+            "smart", "doc.md", "Just prose, no headings at all."
+        ) == "semantic"
+        # A '#' that is not a heading must not count.
+        assert resolve_chunking_strategy(
+            "smart", "doc.markdown", "See issue #42 for details."
+        ) == "semantic"
+
+    def test_code_files_use_recursive(self):
+        for name in ("mod.py", "app.ts", "main.go", "lib.rs", "hdr.h"):
+            assert resolve_chunking_strategy("smart", name, "x = 1") == "recursive"
+
+    def test_unknown_or_missing_filename_defaults_to_semantic(self):
+        assert resolve_chunking_strategy("smart", "report.pdf", "text") == "semantic"
+        assert resolve_chunking_strategy("smart", None, "text") == "semantic"
+        assert resolve_chunking_strategy("smart", "no-extension", "text") == "semantic"
+
+    def test_resolution_is_accepted_by_the_factory(self):
+        """The whole point: create_chunker rejects 'smart' but accepts the result.
+
+        Every ingest path must resolve first — four of them used to pass
+        'smart' straight through and raise ValueError.
+        """
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            create_chunker(strategy="smart")
+
+        for filename, content in [
+            ("doc.md", "# Title"),
+            ("doc.md", "no headers"),
+            ("mod.py", "x = 1"),
+            ("report.pdf", "text"),
+            (None, "text"),
+        ]:
+            resolved = resolve_chunking_strategy("smart", filename, content)
+            assert create_chunker(strategy=resolved) is not None
 
 
 class TestDocumentIngestor:
