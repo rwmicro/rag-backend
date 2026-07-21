@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSION: int = 1024
     EMBEDDING_DEVICE: str = "cuda"
     EMBEDDING_BATCH_SIZE: int = 256
+    # Required by every branch of create_embedding_model(). Cosine similarity is
+    # computed as an inner product over unit vectors, so this must stay True
+    # unless the vector store is changed to normalize on its own.
+    NORMALIZE_EMBEDDINGS: bool = True
 
     # =============================================================================
     # VECTOR STORE (Database choice)
@@ -86,10 +90,14 @@ class Settings(BaseSettings):
     USE_HYBRID_SEARCH: bool = True
     HYBRID_ALPHA: float = 0.5            # 0 = BM25 only, 1 = vector only
     ENABLE_ADAPTIVE_ALPHA: bool = False
+    ADAPTIVE_ALPHA_MIN: float = 0.2      # Favor BM25 for keyword-ish queries
+    ADAPTIVE_ALPHA_MAX: float = 0.95     # Favor vectors for semantic queries
     SCORE_NORMALIZATION_METHOD: str = "rrf"
+    RRF_K: int = 60                      # Reciprocal Rank Fusion constant (standard in the literature)
     INITIAL_RETRIEVAL_K: int = 20
     FINAL_TOP_K: int = 5
     MIN_SIMILARITY_SCORE: float = 0.0
+    DEDUP_SIMILARITY_THRESHOLD: float = 0.95   # Cosine similarity above which chunks are duplicates
     ENABLE_MULTI_HOP: bool = False
 
     # =============================================================================
@@ -194,6 +202,22 @@ class Settings(BaseSettings):
     ENABLE_QUERY_LOGGING: bool = True
     MAX_QUERY_LOGS: int = 1000
     QUERY_LOG_PATH: str = "./data/query_logs.jsonl"
+
+    # =============================================================================
+    # CONTEXTUAL SUMMARIES
+    # =============================================================================
+    CONTEXT_SUMMARY_MAX_TOKENS: int = 150   # ~2-3 sentences
+
+    # =============================================================================
+    # MULTILINGUAL PIPELINE (opt-in; consumed by create_multilingual_pipeline)
+    # =============================================================================
+    USE_MULTILINGUAL_EMBEDDINGS: bool = False
+    MULTILINGUAL_EMBEDDING_MODEL: str = "intfloat/multilingual-e5-large"
+    ENABLE_MULTILINGUAL_BM25: bool = False
+    BM25_USE_STEMMING: bool = True
+    ENABLE_MULTILINGUAL_HYDE: bool = False
+    ENABLE_MULTILINGUAL_QUERY_CLASSIFICATION: bool = False
+    DEFAULT_LANGUAGE: str = "en"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
