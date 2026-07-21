@@ -8,12 +8,11 @@ from abc import ABC, abstractmethod
 import numpy as np
 from pathlib import Path
 import pickle
+import threading
 from loguru import logger
 
 # Import vector stores
 import lancedb
-from lancedb.pydantic import LanceModel, Vector
-from lancedb.embeddings import EmbeddingFunctionRegistry
 import faiss
 from chromadb import Client as ChromaClient
 from chromadb.config import Settings as ChromaSettings
@@ -21,6 +20,10 @@ from chromadb.config import Settings as ChromaSettings
 from config.settings import settings
 from .chunking import Chunk
 from .metadata_filter import MetadataFilter, build_chroma_filter
+
+
+class VectorStoreIntegrityError(RuntimeError):
+    """Raised when an operation would corrupt or silently discard indexed data."""
 
 
 class VectorStore(ABC):
@@ -315,6 +318,13 @@ class FAISSStore(VectorStore):
         self.use_gpu = use_gpu
         self.metadata_store = metadata_store
 
+        # Ingest runs in Starlette's threadpool while queries run on the event
+        # loop, so add/delete can mutate the index mid-`search`. FAISS is not
+        # thread-safe for concurrent read+write, and `chunks_metadata` is indexed
+        # positionally by the search results, so both must move atomically.
+        # Reentrant: delete_by_filename() delegates to delete_by_chunk_ids().
+        self._lock = threading.RLock()
+
         # Create or load index
         if Path(self.index_path).exists():
             self.index = faiss.read_index(self.index_path)
@@ -371,32 +381,37 @@ class FAISSStore(VectorStore):
         # Normalize for cosine similarity
         faiss.normalize_L2(embeddings)
 
-        # Get current index size (for building chunk_id mapping)
-        start_idx = self.index.ntotal
+        with self._lock:
+            # Get current index size (for building chunk_id mapping).
+            # read-modify-write on ntotal: two concurrent ingests would otherwise
+            # compute the same start_idx and overwrite each other's mapping.
+            start_idx = self.index.ntotal
 
-        # Add to index
-        self.index.add(embeddings)
+            # Add to index
+            self.index.add(embeddings)
 
-        # Store metadata and update mapping
-        for i, chunk in enumerate(chunks):
-            idx = start_idx + i
-            self.chunks_metadata.append(
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "content": chunk.content,
-                    "metadata": chunk.metadata,
-                }
-            )
-            self.chunk_id_to_index[chunk.chunk_id] = idx
+            # Store metadata and update mapping
+            for i, chunk in enumerate(chunks):
+                idx = start_idx + i
+                self.chunks_metadata.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "content": chunk.content,
+                        "metadata": chunk.metadata,
+                    }
+                )
+                self.chunk_id_to_index[chunk.chunk_id] = idx
 
-            # Also add to metadata store if available
-            if self.metadata_store and chunk.metadata:
-                self.metadata_store.add_chunk_metadata(chunk.chunk_id, chunk.metadata)
+                # Also add to metadata store if available
+                if self.metadata_store and chunk.metadata:
+                    self.metadata_store.add_chunk_metadata(
+                        chunk.chunk_id, chunk.metadata
+                    )
 
-        logger.info(f"Added {len(chunks)} chunks to FAISS")
+            logger.info(f"Added {len(chunks)} chunks to FAISS")
 
-        # Save index, metadata, AND embeddings (for visualization)
-        self._save(embeddings=embeddings)
+            # Save index, metadata, AND embeddings (for visualization)
+            self._save(embeddings=embeddings)
 
     def search(
         self,
@@ -405,45 +420,49 @@ class FAISSStore(VectorStore):
         metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[Chunk, float]]:
         """Search FAISS with optional metadata filtering"""
-        if self.index.ntotal == 0:
-            return []
-
         # Prepare query
         query = np.array([query_embedding], dtype=np.float32)
         faiss.normalize_L2(query)
 
-        # Search with MANY more results if filtering (Hakka content may rank low semantically)
-        search_k = min(500, self.index.ntotal) if metadata_filter else top_k
-        scores, indices = self.index.search(query, search_k)
+        # The lock spans the search AND the metadata lookup: the returned indices
+        # are positions in chunks_metadata, so a concurrent delete (which rebuilds
+        # both) would make them point at the wrong chunks.
+        with self._lock:
+            if self.index.ntotal == 0:
+                return []
 
-        # Convert to Chunk objects and apply filter
-        chunks_with_scores = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(self.chunks_metadata):
-                continue
+            # Search with MANY more results if filtering (Hakka content may rank low semantically)
+            search_k = min(500, self.index.ntotal) if metadata_filter else top_k
+            scores, indices = self.index.search(query, search_k)
 
-            metadata_entry = self.chunks_metadata[idx]
+            # Convert to Chunk objects and apply filter
+            chunks_with_scores = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < 0 or idx >= len(self.chunks_metadata):
+                    continue
 
-            # Apply metadata filter
-            if metadata_filter and not self._matches_filter(
-                metadata_entry["metadata"], metadata_filter
-            ):
-                continue
+                metadata_entry = self.chunks_metadata[idx]
 
-            chunk = Chunk(
-                chunk_id=metadata_entry["chunk_id"],
-                content=metadata_entry["content"],
-                metadata=metadata_entry["metadata"],
-            )
+                # Apply metadata filter
+                if metadata_filter and not self._matches_filter(
+                    metadata_entry["metadata"], metadata_filter
+                ):
+                    continue
 
-            # FAISS returns inner product (for normalized vectors, this is cosine similarity)
-            chunks_with_scores.append((chunk, float(score)))
+                chunk = Chunk(
+                    chunk_id=metadata_entry["chunk_id"],
+                    content=metadata_entry["content"],
+                    metadata=metadata_entry["metadata"],
+                )
 
-            # Stop when we have enough results
-            if len(chunks_with_scores) >= top_k:
-                break
+                # FAISS returns inner product (for normalized vectors, this is cosine similarity)
+                chunks_with_scores.append((chunk, float(score)))
 
-        return chunks_with_scores
+                # Stop when we have enough results
+                if len(chunks_with_scores) >= top_k:
+                    break
+
+            return chunks_with_scores
 
     def search_with_metadata_store(
         self,
@@ -463,10 +482,8 @@ class FAISSStore(VectorStore):
         Returns:
             List of (chunk, score) tuples
         """
-        if self.index.ntotal == 0:
-            return []
-
         # If no metadata store or no filters, fall back to regular search
+        # (which takes the lock itself).
         if not self.metadata_store or not metadata_filters:
             return self.search(query_embedding, top_k)
 
@@ -477,61 +494,67 @@ class FAISSStore(VectorStore):
             logger.warning("No chunks match metadata filters")
             return []
 
-        # Convert chunk IDs to FAISS indices
-        eligible_indices = []
-        for chunk_id in eligible_chunk_ids:
-            if chunk_id in self.chunk_id_to_index:
-                eligible_indices.append(self.chunk_id_to_index[chunk_id])
+        # chunk_id_to_index, the search and chunks_metadata must all be read from
+        # the same index generation — see the note in search().
+        with self._lock:
+            if self.index.ntotal == 0:
+                return []
 
-        if not eligible_indices:
-            logger.warning("No eligible chunks found in FAISS index")
-            return []
+            # Convert chunk IDs to FAISS indices
+            eligible_indices = []
+            for chunk_id in eligible_chunk_ids:
+                if chunk_id in self.chunk_id_to_index:
+                    eligible_indices.append(self.chunk_id_to_index[chunk_id])
 
-        logger.info(
-            f"Pre-filtered to {len(eligible_indices)} eligible chunks from {len(metadata_filters)} filters"
-        )
+            if not eligible_indices:
+                logger.warning("No eligible chunks found in FAISS index")
+                return []
 
-        # Create ID selector for FAISS
-        eligible_indices_np = np.array(eligible_indices, dtype=np.int64)
-        id_selector = faiss.IDSelectorArray(
-            len(eligible_indices_np), faiss.swig_ptr(eligible_indices_np)
-        )
-
-        # Prepare query
-        query = np.array([query_embedding], dtype=np.float32)
-        faiss.normalize_L2(query)
-
-        # Create search parameters with selector
-        params = faiss.SearchParametersHNSW()
-        params.sel = id_selector
-
-        # Search only within eligible IDs
-        search_k = min(top_k * 2, len(eligible_indices))  # Over-fetch slightly
-        scores, indices = self.index.search(query, search_k, params=params)
-
-        # Convert to Chunk objects
-        chunks_with_scores = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(self.chunks_metadata):
-                continue
-
-            metadata_entry = self.chunks_metadata[idx]
-
-            chunk = Chunk(
-                chunk_id=metadata_entry["chunk_id"],
-                content=metadata_entry["content"],
-                metadata=metadata_entry["metadata"],
+            logger.info(
+                f"Pre-filtered to {len(eligible_indices)} eligible chunks from {len(metadata_filters)} filters"
             )
 
-            chunks_with_scores.append((chunk, float(score)))
+            # Create ID selector for FAISS
+            eligible_indices_np = np.array(eligible_indices, dtype=np.int64)
+            id_selector = faiss.IDSelectorArray(
+                len(eligible_indices_np), faiss.swig_ptr(eligible_indices_np)
+            )
 
-            if len(chunks_with_scores) >= top_k:
-                break
+            # Prepare query
+            query = np.array([query_embedding], dtype=np.float32)
+            faiss.normalize_L2(query)
 
-        logger.debug(
-            f"Metadata pre-filtering returned {len(chunks_with_scores)} results"
-        )
-        return chunks_with_scores
+            # Create search parameters with selector
+            params = faiss.SearchParametersHNSW()
+            params.sel = id_selector
+
+            # Search only within eligible IDs
+            search_k = min(top_k * 2, len(eligible_indices))  # Over-fetch slightly
+            scores, indices = self.index.search(query, search_k, params=params)
+
+            # Convert to Chunk objects
+            chunks_with_scores = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < 0 or idx >= len(self.chunks_metadata):
+                    continue
+
+                metadata_entry = self.chunks_metadata[idx]
+
+                chunk = Chunk(
+                    chunk_id=metadata_entry["chunk_id"],
+                    content=metadata_entry["content"],
+                    metadata=metadata_entry["metadata"],
+                )
+
+                chunks_with_scores.append((chunk, float(score)))
+
+                if len(chunks_with_scores) >= top_k:
+                    break
+
+            logger.debug(
+                f"Metadata pre-filtering returned {len(chunks_with_scores)} results"
+            )
+            return chunks_with_scores
 
     def _matches_filter(
         self, metadata: Dict[str, Any], filter_dict: Dict[str, Any]
@@ -541,21 +564,26 @@ class FAISSStore(VectorStore):
 
     def delete_by_filename(self, filename: str) -> None:
         """Delete chunks by filename (requires rebuilding the HNSW index)."""
-        chunk_ids = [
-            m["chunk_id"]
-            for m in self.chunks_metadata
-            if m["metadata"].get("filename") == filename
-        ]
-        if not chunk_ids:
-            return
-        self.delete_by_chunk_ids(chunk_ids)
-        logger.info(f"Deleted chunks for file: {filename}")
+        with self._lock:
+            chunk_ids = [
+                m["chunk_id"]
+                for m in self.chunks_metadata
+                if m["metadata"].get("filename") == filename
+            ]
+            if not chunk_ids:
+                return
+            self.delete_by_chunk_ids(chunk_ids)
+            logger.info(f"Deleted chunks for file: {filename}")
 
     def delete_by_chunk_ids(self, chunk_ids: List[str]) -> None:
         """Delete chunks by chunk_id, rebuilding the HNSW index from kept embeddings."""
         if not chunk_ids:
             return
 
+        with self._lock:
+            self._delete_by_chunk_ids_locked(chunk_ids)
+
+    def _delete_by_chunk_ids_locked(self, chunk_ids: List[str]) -> None:
         ids_set = set(chunk_ids)
         keep_mask = np.array(
             [m["chunk_id"] not in ids_set for m in self.chunks_metadata], dtype=bool
@@ -564,18 +592,30 @@ class FAISSStore(VectorStore):
         if keep_mask.all():
             return  # Nothing to remove
 
-        kept_metadata = [m for m, keep in zip(self.chunks_metadata, keep_mask) if keep]
-
-        if (
-            self.stored_embeddings is not None
-            and len(self.stored_embeddings) == len(self.chunks_metadata)
-        ):
-            kept_embeddings = self.stored_embeddings[keep_mask]
-        else:
-            kept_embeddings = None
-            logger.warning(
-                "FAISS stored_embeddings unavailable or out-of-sync; rebuild will clear the index"
+        # HNSW cannot remove vectors in place, so a delete means rebuilding the
+        # index from the embeddings we kept. Without those embeddings the rebuild
+        # would produce an EMPTY index while chunks_metadata still lists the kept
+        # chunks — silent, total data loss. Refuse instead, before mutating state.
+        if self.stored_embeddings is None:
+            raise VectorStoreIntegrityError(
+                f"Cannot delete {len(chunk_ids)} chunk(s) from {self.index_path}: "
+                f"stored embeddings are missing "
+                f"({Path(self.index_path).with_suffix('.embeddings.npy')} absent or unreadable), "
+                "so the index cannot be rebuilt without discarding every remaining vector. "
+                "Re-ingest this collection to regenerate the embeddings file, then retry."
             )
+
+        if len(self.stored_embeddings) != len(self.chunks_metadata):
+            raise VectorStoreIntegrityError(
+                f"Cannot delete {len(chunk_ids)} chunk(s) from {self.index_path}: "
+                f"stored embeddings are out of sync with metadata "
+                f"({len(self.stored_embeddings)} embeddings vs "
+                f"{len(self.chunks_metadata)} metadata entries). "
+                "Rebuilding now would corrupt the index. Re-ingest this collection to resync."
+            )
+
+        kept_metadata = [m for m, keep in zip(self.chunks_metadata, keep_mask) if keep]
+        kept_embeddings = self.stored_embeddings[keep_mask]
 
         self.chunks_metadata = kept_metadata
         self.chunk_id_to_index = {m["chunk_id"]: i for i, m in enumerate(kept_metadata)}
@@ -622,12 +662,15 @@ class FAISSStore(VectorStore):
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
-        unique_files = set(m["metadata"].get("filename") for m in self.chunks_metadata)
+        with self._lock:
+            unique_files = set(
+                m["metadata"].get("filename") for m in self.chunks_metadata
+            )
 
-        return {
-            "total_chunks": self.index.ntotal,
-            "total_files": len(unique_files),
-        }
+            return {
+                "total_chunks": self.index.ntotal,
+                "total_files": len(unique_files),
+            }
 
     def _save(self, embeddings: Optional[np.ndarray] = None):
         """Save index, metadata, and optionally embeddings"""
