@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import json
 import re
+import threading
 from loguru import logger
 
 
@@ -215,11 +216,25 @@ class MetadataStore:
         # Ensure directory exists
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        # One connection per thread, like CollectionsDB / JobStore / DocRegistry.
+        # A single shared connection with check_same_thread=False is not safe here:
+        # ingest runs in Starlette's threadpool while queries run on the event loop,
+        # and interleaved use of one sqlite3 connection corrupts cursor state.
+        self._local = threading.local()
         self._create_tables()
         self._create_indexes()
 
         logger.info(f"MetadataStore initialized at {db_path}")
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if getattr(self._local, "conn", None) is None:
+            # Default isolation_level (deferred) is kept on purpose, unlike the
+            # other stores: this class batches writes behind explicit commit()
+            # calls (see add_chunks_batch), which autocommit would break apart.
+            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+        return self._local.conn
 
     def _create_tables(self):
         """Create metadata tables with extensive indexing."""
@@ -474,11 +489,17 @@ class MetadataStore:
         return stats
 
     def close(self):
-        """Close database connection."""
-        if self.conn:
-            self.conn.close()
+        """Close this thread's database connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
             logger.info("MetadataStore connection closed")
 
     def __del__(self):
         """Cleanup on deletion."""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown can tear down sqlite3/logger before __del__ runs.
+            pass

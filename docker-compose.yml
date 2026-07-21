@@ -74,7 +74,11 @@ services:
       - .env
     environment:
       # CPU-specific overrides
-      - WORKERS=2
+      # WORKERS must stay 1: the FAISS index and its metadata live in process
+      # memory and are flushed to ./data/faiss/*. Two workers would each hold a
+      # divergent copy of the same collection and overwrite each other's writes
+      # (last flush wins, silently losing chunks). Scale with threads, not workers.
+      - WORKERS=1
       - EMBEDDING_DEVICE=cpu
       - EMBEDDING_BATCH_SIZE=128
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}

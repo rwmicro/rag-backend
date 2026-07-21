@@ -5,7 +5,7 @@ Handles queries with negation by retrieving both positive and negative examples,
 then filtering or re-ranking based on contrastive scoring.
 """
 
-from typing import List, Tuple, Optional, Dict, Any, Set
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 import numpy as np
 import re
@@ -13,7 +13,6 @@ from loguru import logger
 
 from .chunking import Chunk
 from .embeddings import EmbeddingModel
-from config.settings import settings
 
 
 @dataclass

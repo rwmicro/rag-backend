@@ -13,11 +13,63 @@ from rag.ingest import DocumentIngestor, Document
 from rag.chunking import (
     SemanticChunker,
     RecursiveChunker,
-    FixedChunker,
     MarkdownChunker,
+    create_chunker,
+    resolve_chunking_strategy,
     apply_contextual_embeddings,
     Chunk
 )
+
+
+class TestSmartStrategyResolution:
+    """`smart` is a request to pick a strategy, not a chunker itself."""
+
+    def test_concrete_strategies_pass_through(self):
+        for strategy in ("semantic", "recursive", "markdown"):
+            assert resolve_chunking_strategy(strategy, "a.md", "# H") == strategy
+
+    def test_markdown_with_headers(self):
+        assert resolve_chunking_strategy(
+            "smart", "doc.md", "# Title\n\nBody"
+        ) == "markdown"
+
+    def test_markdown_without_headers_falls_back_to_semantic(self):
+        """Markdown chunking keys off headers; without any it has nothing to split on."""
+        assert resolve_chunking_strategy(
+            "smart", "doc.md", "Just prose, no headings at all."
+        ) == "semantic"
+        # A '#' that is not a heading must not count.
+        assert resolve_chunking_strategy(
+            "smart", "doc.markdown", "See issue #42 for details."
+        ) == "semantic"
+
+    def test_code_files_use_recursive(self):
+        for name in ("mod.py", "app.ts", "main.go", "lib.rs", "hdr.h"):
+            assert resolve_chunking_strategy("smart", name, "x = 1") == "recursive"
+
+    def test_unknown_or_missing_filename_defaults_to_semantic(self):
+        assert resolve_chunking_strategy("smart", "report.pdf", "text") == "semantic"
+        assert resolve_chunking_strategy("smart", None, "text") == "semantic"
+        assert resolve_chunking_strategy("smart", "no-extension", "text") == "semantic"
+
+    def test_resolution_is_accepted_by_the_factory(self):
+        """The whole point: create_chunker rejects 'smart' but accepts the result.
+
+        Every ingest path must resolve first — four of them used to pass
+        'smart' straight through and raise ValueError.
+        """
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            create_chunker(strategy="smart")
+
+        for filename, content in [
+            ("doc.md", "# Title"),
+            ("doc.md", "no headers"),
+            ("mod.py", "x = 1"),
+            ("report.pdf", "text"),
+            (None, "text"),
+        ]:
+            resolved = resolve_chunking_strategy("smart", filename, content)
+            assert create_chunker(strategy=resolved) is not None
 
 
 class TestDocumentIngestor:
@@ -53,13 +105,17 @@ Content in section 2.
         assert "Section 1" in document.content
 
     def test_ingest_text(self, ingestor):
-        """Test ingesting plain text"""
+        """Plain text goes through the markdown parser — there is no "text" type.
+
+        Supported doc_types are pdf / markdown / csv / tsv; main.py maps ingested
+        .txt files to "markdown" for the same reason.
+        """
         text_content = "This is plain text content for testing."
 
         document = ingestor.ingest_from_buffer(
             content=text_content.encode('utf-8'),
             filename="test.txt",
-            doc_type="text"
+            doc_type="markdown"
         )
 
         assert isinstance(document, Document)
@@ -70,21 +126,33 @@ Content in section 2.
 class TestChunkers:
     """Test different chunking strategies"""
 
-    def test_fixed_chunker(self):
-        """Test fixed-size chunking"""
-        chunker = FixedChunker(chunk_size=50, chunk_overlap=10)
+    def test_create_chunker_factory(self):
+        """The factory used in production maps strategy names to chunker classes."""
+        assert isinstance(create_chunker(strategy="semantic"), SemanticChunker)
+        assert isinstance(create_chunker(strategy="recursive"), RecursiveChunker)
+        assert isinstance(create_chunker(strategy="markdown"), MarkdownChunker)
 
-        content = "a" * 200  # 200 characters
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            create_chunker(strategy="fixed")
+
+    def test_chunk_size_is_measured_in_tokens(self):
+        """chunk_size is a token budget, not a character count."""
+        chunker = RecursiveChunker(chunk_size=50, chunk_overlap=10, min_chunk_size=1)
+
+        content = "This is a sentence. " * 100
         chunks = chunker.chunk_document(content, {"filename": "test.txt"})
 
-        assert len(chunks) > 0
-        # Check that chunks are roughly the right size
+        assert len(chunks) > 1
         for chunk in chunks:
-            assert len(chunk.content) <= 60  # chunk_size + some tolerance
+            # Regression guard: chunk_size used to be multiplied by 4 before being
+            # handed to a token-measuring splitter, yielding ~4x oversized chunks.
+            assert chunker.count_tokens(chunk.content) <= 50
 
     def test_recursive_chunker(self):
         """Test recursive text splitting"""
-        chunker = RecursiveChunker(chunk_size=100, chunk_overlap=20)
+        # min_chunk_size=1: the default (max(50, chunk_size//2) tokens) would
+        # discard this whole sample as too small and yield zero chunks.
+        chunker = RecursiveChunker(chunk_size=100, chunk_overlap=20, min_chunk_size=1)
 
         content = """This is paragraph one. It has multiple sentences.
 
@@ -101,7 +169,7 @@ This is paragraph three."""
 
     def test_markdown_chunker(self):
         """Test markdown-aware chunking"""
-        chunker = MarkdownChunker(chunk_size=200, chunk_overlap=50)
+        chunker = MarkdownChunker(chunk_size=200, chunk_overlap=50, min_chunk_size=1)
 
         content = """# Main Title
 
@@ -122,9 +190,17 @@ More content here."""
         chunks = chunker.chunk_document(content, {"filename": "test.md"})
 
         assert len(chunks) > 0
-        # Verify some chunks contain headers
-        has_header = any("##" in chunk.content or "#" in chunk.content for chunk in chunks)
-        assert has_header
+
+        # The header hierarchy is lifted out of the text into metadata ("Header 1",
+        # "Header 2", …) rather than left as "#" markup inside chunk.content.
+        assert all(chunk.metadata["Header 1"] == "Main Title" for chunk in chunks)
+
+        sections = {chunk.metadata.get("Header 2") for chunk in chunks}
+        assert {"Section 1", "Section 2"} <= sections
+
+        deepest = [c for c in chunks if c.metadata.get("Header 3") == "Subsection 1.1"]
+        assert len(deepest) == 1
+        assert deepest[0].content.strip() == "Detailed content here."
 
     def test_semantic_chunker(self):
         """Test semantic chunking (sentence-based)"""
@@ -142,7 +218,9 @@ New paragraph starts here. It continues with more text. And concludes."""
 
     def test_chunk_metadata(self):
         """Test that chunks have proper metadata"""
-        chunker = FixedChunker(chunk_size=50, chunk_overlap=10)
+        # min_chunk_size defaults to max(50, chunk_size // 2) tokens, which would
+        # discard this short sample entirely and make the assertions vacuous.
+        chunker = RecursiveChunker(chunk_size=50, chunk_overlap=10, min_chunk_size=1)
 
         metadata = {
             "filename": "test.pdf",
@@ -153,11 +231,13 @@ New paragraph starts here. It continues with more text. And concludes."""
         content = "Some test content here."
         chunks = chunker.chunk_document(content, metadata)
 
+        assert len(chunks) > 0
         for i, chunk in enumerate(chunks):
             assert chunk.metadata["filename"] == "test.pdf"
             assert chunk.metadata["page"] == 1
             assert chunk.metadata["chunk_index"] == i
-            assert "chunk_id" in chunk.chunk_id
+            # chunk_id is "{filename}-{index}"
+            assert chunk.chunk_id == f"test.pdf-{i}"
 
     def test_contextual_embeddings(self):
         """Test applying contextual embeddings"""
@@ -193,7 +273,7 @@ New paragraph starts here. It continues with more text. And concludes."""
 
     def test_empty_content_handling(self):
         """Test handling of empty or whitespace content"""
-        chunker = FixedChunker(chunk_size=50, chunk_overlap=10)
+        chunker = RecursiveChunker(chunk_size=50, chunk_overlap=10, min_chunk_size=1)
 
         # Empty content
         chunks = chunker.chunk_document("", {"filename": "empty.txt"})
@@ -209,7 +289,7 @@ class TestChunkOverlap:
 
     def test_overlap_creates_continuity(self):
         """Test that overlap creates continuity between chunks"""
-        chunker = FixedChunker(chunk_size=20, chunk_overlap=5)
+        chunker = RecursiveChunker(chunk_size=20, chunk_overlap=5, min_chunk_size=1)
 
         content = "abcdefghijklmnopqrstuvwxyz" * 3
 
@@ -225,7 +305,7 @@ class TestChunkOverlap:
 
     def test_no_overlap(self):
         """Test chunking with zero overlap"""
-        chunker = FixedChunker(chunk_size=20, chunk_overlap=0)
+        chunker = RecursiveChunker(chunk_size=20, chunk_overlap=0, min_chunk_size=1)
 
         content = "a" * 100
 

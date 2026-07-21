@@ -4,7 +4,6 @@ Reduces context size while preserving information
 """
 
 from typing import List, Tuple, Optional
-import numpy as np
 from loguru import logger
 import tiktoken
 

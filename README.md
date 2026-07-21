@@ -10,6 +10,7 @@ Retrieval-Augmented Generation service for document-based search and answer gene
 - **Embeddings**: E5, BGE, Multilingual (20+ models)
 - **Vector stores**: FAISS, LanceDB, ChromaDB, SQLite-VSS
 - **Retrieval**: Hybrid (vector + BM25), Graph RAG, HyDE, Multi-query, Multi-hop, Contrastive
+- **Corrective RAG**: grades the retrieved set and retries with a rewritten query
 - **Reranking**: BGE cross-encoder
 - **LLM**: Ollama (default), any OpenAI-compatible API
 - **Multilingual**: 20+ languages in retrieval, 100+ in detection
@@ -69,6 +70,11 @@ DELETE /collections/{id}
 DELETE /collections/{id}/documents/{filename}
 ```
 
+Deleting a document rebuilds the FAISS index from the embeddings that remain.
+If the stored embeddings file is missing or out of sync the rebuild cannot be
+done without discarding everything, so the request is refused with **409** and
+nothing is modified — re-ingest the collection to regenerate it, then retry.
+
 ### Ingestion
 
 **Single file (blocking)**
@@ -79,6 +85,15 @@ curl -X POST http://localhost:8001/ingest/file \
   -F "chunk_size=1000" \
   -F "chunking_strategy=semantic"
 ```
+
+`chunk_size` and `chunk_overlap` are counted in **tokens**, not characters.
+Fragments shorter than `min_chunk_size` (default `max(50, chunk_size // 2)`
+tokens) are dropped, so a small `chunk_size` on short documents can legitimately
+yield no chunks.
+
+Strategies are `semantic`, `recursive`, `markdown`, or `smart` — which picks one
+per document from the file extension and, for Markdown, whether it actually has
+headers. `smart` works on every ingest route.
 
 **Single file (async — recommended for large files)**
 ```bash
@@ -169,6 +184,7 @@ Query
   → Conversation contextualization
   → Query routing (optional)
   → Retrieval: HyDE / Multi-query / Hybrid (vector + BM25)
+  → Corrective loop: grade + retry with a rewritten query (optional)
   → Graph RAG enhancement (optional)
   → Reranking + deduplication
   → MMR diversity (optional)
@@ -182,7 +198,9 @@ Query
 ```
 rag-backend/
 ├── rag/
-│   ├── main.py              # FastAPI app + all endpoints
+│   ├── main.py              # FastAPI app, lifespan, query/ingest/collection endpoints
+│   ├── routers/             # Health, jobs, cache, config, stats, models, evaluate
+│   ├── app_state.py         # Lazy singletons for the SQLite stores
 │   ├── collections_db.py    # SQLite collections store
 │   ├── job_store.py         # Async job tracking
 │   ├── doc_registry.py      # Document deduplication
@@ -199,12 +217,15 @@ rag-backend/
 ├── config/
 │   └── settings.py
 ├── data/                    # Runtime data (auto-created)
-│   ├── faiss/
+│   ├── faiss/               # index.faiss + .metadata.pkl + .embeddings.npy
 │   ├── graph_cache/
 │   ├── collections.db
 │   ├── jobs.db
-│   └── doc_registry.db
+│   ├── doc_registry.db
+│   ├── metadata.db
+│   └── feedback.db
 ├── tests/
+│   ├── conftest.py          # Redirects the stores to a temp dir per test
 │   ├── test_integration.py
 │   └── ...
 └── docker-compose.yml
@@ -231,12 +252,43 @@ docker ps --filter "publish=8001"
 docker stop <container_id>
 ```
 
+**Do not raise the uvicorn worker count**
+
+The FAISS index and its metadata are in-process state flushed to `./data/faiss`.
+A second worker holds its own copy of the same collection and overwrites the
+first's writes on flush, silently losing chunks. The Dockerfile pins
+`--workers 1` for this reason. Concurrency comes from threads instead: requests
+that do model work run in the threadpool, and the stores are lock-guarded.
+
 ## Tests
 
-```bash
-# Unit tests
-pytest tests/ -m "not integration"
+The pinned dependencies (`numpy<2.0`, `torch<2.10`, `sentence-transformers<3.0`,
+`spacy<4`) have no wheels for recent Python versions, so run the suite inside the
+project image rather than on the host:
 
-# Integration tests (requires running server)
-pytest tests/test_integration.py -v -m integration
+```bash
+docker build --target runtime-cpu -t rag-test:cpu .
+
+docker run --rm -v "$(pwd)":/app -w /app rag-test:cpu \
+  sh -c "pip install -q -r requirements-dev.txt; pytest tests/ -q"
 ```
+
+Mounting the working tree means you test current code without rebuilding.
+
+```bash
+pytest tests/ -m "not integration"   # 80 tests
+pytest tests/ -m integration         # 14 tests, end-to-end through the app
+```
+
+Integration tests do **not** need a running server — they drive the app in-process
+with `TestClient`, which also runs the lifespan startup. They do download real
+models on first run (e5-large, ~2.2 GB), as do the Graph RAG tests, so mount a
+cache to keep reruns cheap:
+
+```bash
+-v /tmp/hfcache:/tmp/hfcache -e HF_HOME=/tmp/hfcache -e EMBEDDING_DEVICE=cpu
+```
+
+Tests redirect every store to a temp directory (`tests/conftest.py`), so a run
+never touches `./data/`. A native shutdown crash in torch/faiss can swallow
+pytest's final tally — use `--junitxml` if you need reliable counts.

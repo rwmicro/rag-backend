@@ -12,75 +12,49 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rag.chunking import Chunk
 from rag.retrieval import (
-    normalize_scores,
+    normalize_minmax,
+    normalize_zscore,
     reciprocal_rank_fusion,
     deduplicate_chunks
 )
 
 
 class TestScoreNormalization:
-    """Test score normalization methods"""
+    """Test score normalization helpers (operate on plain score lists)."""
 
     def test_minmax_normalization(self):
-        """Test min-max normalization"""
-        chunks = [
-            (Chunk("1", "content1", {}), 0.9),
-            (Chunk("2", "content2", {}), 0.5),
-            (Chunk("3", "content3", {}), 0.1),
-        ]
+        """Min-max rescales to [0, 1] with the extremes pinned."""
+        normalized = normalize_minmax([0.9, 0.5, 0.1])
 
-        normalized = normalize_scores(chunks, method="minmax")
+        assert all(0 <= score <= 1 for score in normalized)
+        assert normalized[0] == 1.0  # highest -> 1
+        assert normalized[2] == 0.0  # lowest  -> 0
+        # Order is preserved (it maps element-wise, it does not sort).
+        assert normalized == sorted(normalized, reverse=True)
 
-        # Check that scores are in [0, 1] range
-        scores = [score for _, score in normalized]
-        assert all(0 <= score <= 1 for score in scores)
-
-        # Highest original score should be 1.0
-        assert normalized[0][1] == 1.0
-
-        # Lowest original score should be 0.0
-        assert normalized[2][1] == 0.0
+    def test_minmax_constant_scores(self):
+        """A flat list has no spread to rescale — everything collapses to 1.0."""
+        assert normalize_minmax([0.4, 0.4, 0.4]) == [1.0, 1.0, 1.0]
 
     def test_zscore_normalization(self):
-        """Test z-score normalization"""
-        chunks = [
-            (Chunk("1", "content1", {}), 0.9),
-            (Chunk("2", "content2", {}), 0.5),
-            (Chunk("3", "content3", {}), 0.5),
-            (Chunk("4", "content4", {}), 0.1),
-        ]
+        """Z-score standardises then squashes through a sigmoid into [0, 1]."""
+        normalized = normalize_zscore([0.9, 0.5, 0.5, 0.1])
 
-        normalized = normalize_scores(chunks, method="zscore")
+        assert all(0 <= score <= 1 for score in normalized)
+        # The sigmoid is centred on the mean, so the mean maps to ~0.5 —
+        # NOT to 0, which is what a raw z-score would give.
+        assert abs(np.mean(normalized) - 0.5) < 0.1
+        assert normalized[0] > normalized[1]  # ranking preserved
+        assert normalized[1] == normalized[2]  # equal inputs -> equal outputs
 
-        # After z-score, mean should be ~0
-        scores = [score for _, score in normalized]
-        mean_score = np.mean(scores)
-        assert abs(mean_score) < 0.1  # Close to 0
+    def test_zscore_constant_scores(self):
+        """Zero variance means no z-score is defined — fall back to 1.0."""
+        assert normalize_zscore([0.4, 0.4, 0.4]) == [1.0, 1.0, 1.0]
 
-    def test_rrf_normalization(self):
-        """Test Reciprocal Rank Fusion scoring"""
-        chunks = [
-            (Chunk("1", "content1", {}), 0.9),
-            (Chunk("2", "content2", {}), 0.5),
-            (Chunk("3", "content3", {}), 0.1),
-        ]
-
-        normalized = normalize_scores(chunks, method="rrf", k=60)
-
-        # RRF scores should be positive
-        scores = [score for _, score in normalized]
-        assert all(score > 0 for score in scores)
-
-        # Scores should be in descending order (preserved from original)
-        assert scores == sorted(scores, reverse=True)
-
-    def test_empty_chunks_normalization(self):
-        """Test normalization with empty chunk list"""
-        chunks = []
-
-        for method in ["minmax", "zscore", "rrf"]:
-            normalized = normalize_scores(chunks, method=method)
-            assert len(normalized) == 0
+    def test_empty_scores_normalization(self):
+        """Both helpers tolerate an empty list."""
+        assert normalize_minmax([]) == []
+        assert normalize_zscore([]) == []
 
 
 class TestReciprocalRankFusion:
@@ -90,39 +64,42 @@ class TestReciprocalRankFusion:
         """Test basic RRF fusion"""
         # Two result lists with some overlap
         results1 = [
-            (Chunk("A", "content_a", {}), 0.9),
-            (Chunk("B", "content_b", {}), 0.8),
-            (Chunk("C", "content_c", {}), 0.7),
+            (Chunk(chunk_id="A", content="content_a", metadata={}), 0.9),
+            (Chunk(chunk_id="B", content="content_b", metadata={}), 0.8),
+            (Chunk(chunk_id="C", content="content_c", metadata={}), 0.7),
         ]
 
         results2 = [
-            (Chunk("B", "content_b", {}), 0.95),
-            (Chunk("D", "content_d", {}), 0.85),
-            (Chunk("A", "content_a", {}), 0.75),
+            (Chunk(chunk_id="B", content="content_b", metadata={}), 0.95),
+            (Chunk(chunk_id="D", content="content_d", metadata={}), 0.85),
+            (Chunk(chunk_id="A", content="content_a", metadata={}), 0.75),
         ]
 
+        # Returns a dict: {chunk_id: (chunk, rrf_score)} — not a ranked list.
         fused = reciprocal_rank_fusion([results1, results2], k=60)
 
-        # B should rank high (top in both lists)
-        chunk_ids = [chunk.chunk_id for chunk, _ in fused]
-        assert "B" in chunk_ids
+        assert set(fused.keys()) == {"A", "B", "C", "D"}
 
-        # All unique chunks should be in result
-        assert len(set(chunk_ids)) == 4  # A, B, C, D
+        # B is rank 2 then rank 1, so it beats everything appearing in one list only.
+        scores = {cid: score for cid, (_, score) in fused.items()}
+        assert scores["B"] == pytest.approx(1 / 62 + 1 / 61)
+        assert scores["B"] > scores["C"]
+        assert scores["B"] > scores["D"]
+        # A appears in both lists too (rank 1 then rank 3).
+        assert scores["A"] == pytest.approx(1 / 61 + 1 / 63)
 
     def test_rrf_single_list(self):
         """Test RRF with single result list"""
         results = [
-            (Chunk("A", "content_a", {}), 0.9),
-            (Chunk("B", "content_b", {}), 0.8),
+            (Chunk(chunk_id="A", content="content_a", metadata={}), 0.9),
+            (Chunk(chunk_id="B", content="content_b", metadata={}), 0.8),
         ]
 
         fused = reciprocal_rank_fusion([results], k=60)
 
-        # Should return same order
         assert len(fused) == 2
-        assert fused[0][0].chunk_id == "A"
-        assert fused[1][0].chunk_id == "B"
+        # Rank order is preserved through the 1/(k+rank) weighting.
+        assert fused["A"][1] > fused["B"][1]
 
     def test_rrf_empty_lists(self):
         """Test RRF with empty lists"""
@@ -141,27 +118,27 @@ class TestDeduplication:
         # Create chunks with embeddings
         chunks_with_scores = [
             (Chunk(
-                "chunk1",
-                "This is some content about AI.",
-                {},
+                chunk_id="chunk1",
+                content="This is some content about AI.",
+                metadata={},
                 embedding=[0.1, 0.2, 0.3, 0.4]
             ), 0.9),
             (Chunk(
-                "chunk2",
-                "This is some content about AI.",  # Duplicate
-                {},
+                chunk_id="chunk2",
+                content="This is some content about AI.",  # Duplicate
+                metadata={},
                 embedding=[0.1, 0.2, 0.3, 0.4]
             ), 0.85),
             (Chunk(
-                "chunk3",
-                "Completely different topic about biology.",
-                {},
+                chunk_id="chunk3",
+                content="Completely different topic about biology.",
+                metadata={},
                 embedding=[0.9, 0.8, 0.7, 0.6]
             ), 0.8),
         ]
 
         # With high threshold, duplicates should be removed
-        deduplicated = deduplicate_chunks(chunks_with_scores, threshold=0.99)
+        deduplicated = deduplicate_chunks(chunks_with_scores, similarity_threshold=0.99)
 
         # Should keep only 2 chunks (chunk1 and chunk3)
         assert len(deduplicated) == 2
@@ -176,20 +153,20 @@ class TestDeduplication:
         """Test deduplication when no duplicates exist"""
         chunks_with_scores = [
             (Chunk(
-                "chunk1",
-                "Content A",
-                {},
+                chunk_id="chunk1",
+                content="Content A",
+                metadata={},
                 embedding=[0.1, 0.2, 0.3]
             ), 0.9),
             (Chunk(
-                "chunk2",
-                "Content B",
-                {},
+                chunk_id="chunk2",
+                content="Content B",
+                metadata={},
                 embedding=[0.9, 0.8, 0.7]
             ), 0.8),
         ]
 
-        deduplicated = deduplicate_chunks(chunks_with_scores, threshold=0.9)
+        deduplicated = deduplicate_chunks(chunks_with_scores, similarity_threshold=0.9)
 
         # No duplicates, should keep all
         assert len(deduplicated) == 2
@@ -197,39 +174,39 @@ class TestDeduplication:
     def test_deduplicate_without_embeddings(self):
         """Test deduplication when chunks don't have embeddings"""
         chunks_with_scores = [
-            (Chunk("chunk1", "Content A", {}), 0.9),
-            (Chunk("chunk2", "Content B", {}), 0.8),
+            (Chunk(chunk_id="chunk1", content="Content A", metadata={}), 0.9),
+            (Chunk(chunk_id="chunk2", content="Content B", metadata={}), 0.8),
         ]
 
         # Should not crash, just return original
-        deduplicated = deduplicate_chunks(chunks_with_scores, threshold=0.9)
+        deduplicated = deduplicate_chunks(chunks_with_scores, similarity_threshold=0.9)
 
         assert len(deduplicated) == 2
 
     def test_deduplicate_threshold_effect(self):
-        """Test that threshold affects deduplication"""
+        """A LOWER threshold deduplicates more aggressively, not less.
+
+        similarity_threshold is the cosine similarity at which two chunks are
+        considered duplicates, so lowering it makes more pairs qualify.
+        """
+        # These two vectors have a cosine similarity of exactly 0.8.
         chunks_with_scores = [
-            (Chunk(
-                "chunk1",
-                "Similar content",
-                {},
-                embedding=[0.1, 0.2, 0.3]
-            ), 0.9),
-            (Chunk(
-                "chunk2",
-                "Similar content",
-                {},
-                embedding=[0.11, 0.21, 0.31]  # Very similar
-            ), 0.85),
+            (Chunk(chunk_id="chunk1", content="Similar content", metadata={}, embedding=[1.0, 0.0, 0.0]), 0.9),
+            (Chunk(chunk_id="chunk2", content="Similar content", metadata={}, embedding=[0.8, 0.6, 0.0]), 0.85),
         ]
 
-        # High threshold - should remove duplicate
-        deduplicated_high = deduplicate_chunks(chunks_with_scores, threshold=0.95)
-        assert len(deduplicated_high) == 1
+        # Threshold above the pair's similarity -> not duplicates -> both kept.
+        deduplicated_strict = deduplicate_chunks(
+            chunks_with_scores, similarity_threshold=0.95
+        )
+        assert len(deduplicated_strict) == 2
 
-        # Low threshold - should keep both
-        deduplicated_low = deduplicate_chunks(chunks_with_scores, threshold=0.5)
-        assert len(deduplicated_low) == 2
+        # Threshold below it -> treated as duplicates -> only the best-scoring kept.
+        deduplicated_loose = deduplicate_chunks(
+            chunks_with_scores, similarity_threshold=0.5
+        )
+        assert len(deduplicated_loose) == 1
+        assert deduplicated_loose[0][0].chunk_id == "chunk1"
 
 
 class TestChunkScoring:
@@ -238,9 +215,9 @@ class TestChunkScoring:
     def test_score_descending_order(self):
         """Test that chunks are returned in score-descending order"""
         chunks = [
-            (Chunk("1", "content1", {}), 0.5),
-            (Chunk("2", "content2", {}), 0.9),
-            (Chunk("3", "content3", {}), 0.7),
+            (Chunk(chunk_id="1", content="content1", metadata={}), 0.5),
+            (Chunk(chunk_id="2", content="content2", metadata={}), 0.9),
+            (Chunk(chunk_id="3", content="content3", metadata={}), 0.7),
         ]
 
         # Sort by score descending
@@ -252,9 +229,9 @@ class TestChunkScoring:
     def test_score_filtering(self):
         """Test filtering chunks by minimum score"""
         chunks = [
-            (Chunk("1", "content1", {}), 0.9),
-            (Chunk("2", "content2", {}), 0.5),
-            (Chunk("3", "content3", {}), 0.2),
+            (Chunk(chunk_id="1", content="content1", metadata={}), 0.9),
+            (Chunk(chunk_id="2", content="content2", metadata={}), 0.5),
+            (Chunk(chunk_id="3", content="content3", metadata={}), 0.2),
         ]
 
         min_score = 0.4

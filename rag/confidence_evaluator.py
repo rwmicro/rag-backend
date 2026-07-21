@@ -391,7 +391,7 @@ class ConfidenceEvaluator:
                 report += f"  ⚠ {issue}\n"
 
         if evaluation.suggested_fallbacks:
-            report += f"\nSuggested Fallbacks:\n"
+            report += "\nSuggested Fallbacks:\n"
             for i, fallback in enumerate(evaluation.suggested_fallbacks, 1):
                 report += f"  {i}. {fallback.value}\n"
 

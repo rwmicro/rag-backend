@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import MagicMock
 import numpy as np
 
-from rag.retrieval import HybridRetriever, normalize_minmax, normalize_zscore, reciprocal_rank_fusion
+from rag.retrieval import HybridRetriever, normalize_minmax, normalize_zscore
 from rag.chunking import Chunk
 from config.settings import settings
 
@@ -54,11 +54,11 @@ class TestRetrievalScoring:
 
         # Mock vector search results
         vector_results = [
-            (Chunk("1", "content1"), 0.8),
-            (Chunk("2", "content2"), 0.5),
+            (Chunk(chunk_id="1", content="content1", metadata={}), 0.8),
+            (Chunk(chunk_id="2", content="content2", metadata={}), 0.5),
         ]
         # Configure parent Retriever.retrieve mock
-        with pytest.MonkeyPatch.context() as m:
+        with pytest.MonkeyPatch.context():
             # We mock the super().retrieve method by mocking the vector_store.search actually
             # since the base Retriever calls vector_store.search
             vector_store.search.return_value = vector_results
@@ -66,8 +66,8 @@ class TestRetrievalScoring:
 
             # Mock BM25 search
             retriever._bm25_search = MagicMock(return_value=[
-                (Chunk("1", "content1"), 10.0), # High BM25
-                (Chunk("3", "content3"), 5.0),
+                (Chunk(chunk_id="1", content="content1", metadata={}), 10.0), # High BM25
+                (Chunk(chunk_id="3", content="content3", metadata={}), 5.0),
             ])
             
             # Since we are mocking internal methods we need to be careful. 
@@ -96,32 +96,42 @@ class TestRetrievalScoring:
             assert results[0][0].chunk_id == "1"
             assert results[0][1] == 1.0
             
-    def test_default_settings_usage(self, mock_components):
-        """Verify that the retrieve method uses the default setting when None is passed"""
+    def test_default_normalization_method_is_rrf(self, mock_components):
+        """retrieve() falls back to settings.SCORE_NORMALIZATION_METHOD, which is 'rrf'.
+
+        The two methods are distinguishable by score magnitude: RRF yields
+        1/(RRF_K + rank), while min-max yields alpha-weighted values near 1.
+        """
+        assert settings.SCORE_NORMALIZATION_METHOD == "rrf"
+
         vector_store, embedding_model = mock_components
         retriever = HybridRetriever(vector_store, embedding_model)
-        
-        # We need to verify what normalization method is used inside.
-        # This is slightly white-box.
-        
-        # But we can check if it behaves like normalized scores (high) or RRF scores (low)
-        vector_store.search.return_value = [(Chunk("1", "c"), 0.9)]
+
+        vector_store.search.return_value = [
+            (Chunk(chunk_id="1", content="c", metadata={}), 0.9)
+        ]
         embedding_model.encode_single.return_value = np.array([0.1])
         retriever._bm25_search = MagicMock(return_value=[])
-        
-        # Force the settings to be minmax for this test context, though we updated the file
-        # The imported settings object might need reloading or patching if we want to be safe, 
-        # but since we edited the file on disk, if the test process starts fresh it will pick it up.
-        # However, for this specific test method, let's verify assumptions.
-        
+
         results = retriever.retrieve("test", top_k=1, build_bm25=False)
-        score = results[0][1]
-        
-        # If minmax, score should be roughly alpha * 1.0 = 0.7 (default alpha)
-        # If RRF, score should be 1/(60+1) ~ 0.016
-        
-        # With single result in minmax:
-        # Vector scores: [0.9] -> minmax -> [1.0] (handle single value case)
-        # Score = 1.0 * 0.7 = 0.7
-        
-        assert score > 0.1, f"Score {score} is too low, expected MinMax behavior (default)"
+
+        # Single result, rank 1, present in one list only.
+        assert results[0][1] == pytest.approx(1 / (settings.RRF_K + 1))
+
+    def test_explicit_minmax_overrides_the_default(self, mock_components):
+        """Passing normalization_method explicitly wins over the setting."""
+        vector_store, embedding_model = mock_components
+        retriever = HybridRetriever(vector_store, embedding_model, alpha=0.7)
+
+        vector_store.search.return_value = [
+            (Chunk(chunk_id="1", content="c", metadata={}), 0.9)
+        ]
+        embedding_model.encode_single.return_value = np.array([0.1])
+        retriever._bm25_search = MagicMock(return_value=[])
+
+        results = retriever.retrieve(
+            "test", top_k=1, build_bm25=False, normalization_method="minmax"
+        )
+
+        # A lone vector score normalises to 1.0, weighted by alpha; no BM25 side.
+        assert results[0][1] == pytest.approx(0.7)

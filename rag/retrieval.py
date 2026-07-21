@@ -57,6 +57,11 @@ except ImportError:
     )
 
 
+# Below this spread/deviation a score list is treated as constant. Guards the
+# normalizers against dividing by a floating-point residue instead of a true zero.
+_FLOAT_TOLERANCE = 1e-12
+
+
 def normalize_minmax(scores: List[float]) -> List[float]:
     """
     Min-max normalization: scales scores to [0, 1] range
@@ -74,7 +79,8 @@ def normalize_minmax(scores: List[float]) -> List[float]:
     min_score = scores_array.min()
     max_score = scores_array.max()
 
-    if max_score - min_score == 0:
+    # Tolerance, not == 0: a near-zero spread would blow up the division.
+    if max_score - min_score < _FLOAT_TOLERANCE:
         return [1.0] * len(scores)
 
     normalized = (scores_array - min_score) / (max_score - min_score)
@@ -99,7 +105,10 @@ def normalize_zscore(scores: List[float]) -> List[float]:
     mean = scores_array.mean()
     std = scores_array.std()
 
-    if std == 0:
+    # Tolerance, not == 0: np.std of a constant list lands on ~5e-17 rather than
+    # exactly 0, which used to slip past this guard and map every score to
+    # sigmoid(-1) = 0.269 instead of the intended 1.0.
+    if std < _FLOAT_TOLERANCE:
         return [1.0] * len(scores)
 
     # Standardize
@@ -1009,12 +1018,12 @@ class AdaptiveHybridSearch:
         Returns:
             Explanation string
         """
-        explanation = f"Alpha computation for hybrid search:\n"
+        explanation = "Alpha computation for hybrid search:\n"
         explanation += f"  Base α: {adjustment_details['original_alpha']:.2f}\n"
 
         adjustments = adjustment_details.get("adjustments", {})
         if adjustments:
-            explanation += f"  Adjustments applied:\n"
+            explanation += "  Adjustments applied:\n"
             for key, value in adjustments.items():
                 if isinstance(value, dict) and "adjustment" in value:
                     explanation += f"    • {key}: {value['adjustment']:+.2f}\n"
@@ -1022,7 +1031,7 @@ class AdaptiveHybridSearch:
                     explanation += f"    • {key}: {value:+.2f}\n"
 
         explanation += f"  Final α: {adjustment_details['final_alpha']:.2f}\n"
-        explanation += f"  Interpretation: "
+        explanation += "  Interpretation: "
 
         final_alpha = adjustment_details["final_alpha"]
         if final_alpha >= 0.8:

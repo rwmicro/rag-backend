@@ -11,7 +11,7 @@ Usage:
     # Returns: ("fr", 0.98)
 """
 
-from typing import Tuple, Optional
+from typing import Tuple
 import fasttext
 from functools import lru_cache
 import os

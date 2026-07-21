@@ -7,7 +7,6 @@ against real SQLite tempfiles — no mocks.
 
 import os
 import sys
-import tempfile
 import json
 from collections import OrderedDict
 

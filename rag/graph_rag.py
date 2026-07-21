@@ -11,7 +11,6 @@ from collections import defaultdict
 import networkx as nx
 from loguru import logger
 import pickle
-import os
 from pathlib import Path
 
 from .chunking import Chunk
@@ -381,7 +380,7 @@ class GraphRAG:
         # Try to load from cache first
         if not force_rebuild:
             if self.load_cache(cache_name):
-                logger.info(f"Graph loaded from cache, skipping build")
+                logger.info("Graph loaded from cache, skipping build")
                 return
 
         logger.info(f"Building graph from {len(chunks)} chunks...")

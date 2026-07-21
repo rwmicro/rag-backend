@@ -4,9 +4,8 @@ Supports PDF and Markdown with advanced extraction
 Uses pymupdf_layout for enhanced layout analysis
 """
 
-import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Union
 from dataclasses import dataclass
 import pymupdf  # PyMuPDF (fitz)
 
@@ -430,7 +429,6 @@ def parse_csv(file_path: Union[str, Path], **kwargs) -> Document:
     Parse CSV/TSV file into Markdown table format
     """
     import pandas as pd
-    import csv
     
     file_path = Path(file_path)
     logger.info(f"Parsing CSV/TSV: {file_path.name}")
@@ -471,7 +469,6 @@ def scrape_url(url: str, **kwargs) -> Document:
     """
     import requests
     from bs4 import BeautifulSoup
-    import re
     
     logger.info(f"Scraping URL: {url}")
     

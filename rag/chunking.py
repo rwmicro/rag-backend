@@ -213,8 +213,11 @@ class RecursiveChunker(BaseChunker):
 
         # Create LangChain splitter
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size * 4,  # Approximate char count from tokens
-            chunk_overlap=self.chunk_overlap * 4,
+            # length_function measures TOKENS, so chunk_size is a token budget.
+            # It used to be multiplied by 4 (a chars-per-token estimate), which
+            # made every chunk ~4x the requested size.
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
             length_function=self.count_tokens,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
@@ -282,9 +285,11 @@ class MarkdownChunker(BaseChunker):
         )
 
         # Secondary splitter for large sections
+        # As in RecursiveChunker: length_function counts tokens, so the budget
+        # is passed through directly rather than scaled by a chars-per-token factor.
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size * 4,
-            chunk_overlap=self.chunk_overlap * 4,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
             length_function=self.count_tokens,
         )
 
@@ -353,6 +358,60 @@ class MarkdownChunker(BaseChunker):
 
         logger.info(f"Created {len(result)} markdown chunks")
         return result
+
+
+# Extensions the "smart" strategy recognises.
+_MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".go", ".rs", ".cpp", ".c", ".h",
+}
+
+
+def resolve_chunking_strategy(
+    strategy: str,
+    filename: Optional[str] = None,
+    content: str = "",
+) -> str:
+    """Resolve the "smart" pseudo-strategy to a concrete one.
+
+    "smart" is not a chunker: it is a request to pick one from the document
+    itself, so it has to be resolved before create_chunker() sees it. Every
+    ingest path must call this, otherwise create_chunker rejects "smart" as an
+    unknown strategy.
+
+    Args:
+        strategy: Requested strategy, possibly "smart"
+        filename: Source filename, used for its extension (may be absent, e.g. URLs)
+        content: Parsed document text, inspected for Markdown headers
+
+    Returns:
+        A strategy name create_chunker accepts.
+    """
+    if strategy != "smart":
+        return strategy
+
+    ext = ""
+    if filename and "." in filename:
+        ext = filename[filename.rfind("."):].lower()
+
+    if ext in _MARKDOWN_EXTENSIONS:
+        # Markdown chunking keys off headers; without any, it degenerates to
+        # one big section, so fall back to semantic.
+        if re.search(r"^#+\s", content, re.MULTILINE):
+            resolved = "markdown"
+        else:
+            resolved = "semantic"
+    elif ext in _CODE_EXTENSIONS:
+        resolved = "recursive"
+    else:
+        resolved = "semantic"
+
+    logger.info(
+        f"Smart chunking: selected '{resolved}' strategy"
+        f"{f' for {filename}' if filename else ''}"
+    )
+    return resolved
 
 
 def create_chunker(
@@ -613,7 +672,6 @@ class TableAwareChunker:
             # Check if line looks like a table row (has pipes)
             if '|' in line and line.count('|') >= 2:
                 # Found potential table start
-                table_start_line = i
                 table_start_idx = sum(len(lines[j]) + 1 for j in range(i))
 
                 # Collect all consecutive table rows
@@ -697,7 +755,6 @@ class TableAwareChunker:
             # Check for multiple spaces or tabs (column separators)
             if re.search(r'(\s{2,}|\t)', line) and len(line.strip()) > 20:
                 # Potential table row
-                table_start_line = i
                 table_start_idx = sum(len(lines[j]) + 1 for j in range(i))
 
                 table_lines = []

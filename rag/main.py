@@ -18,8 +18,9 @@ import json
 import os
 import time
 import gc
+import asyncio
+import threading
 import torch
-import re
 import pickle
 import numpy as np
 
@@ -32,45 +33,35 @@ from rag import (
     Retriever,
     HybridRetriever,
     MultiQueryRetriever,
-    Reranker,
     ContextCompressor,
     LLMGenerator,
-    get_embedding_cache,
     get_query_cache,
     get_semantic_cache,
     GraphRAG,
-    HyDE,
-    AdaptiveHyDE,
 )
-from rag.query_classifier import QueryClassifier, QueryType
-from rag.confidence_evaluator import ConfidenceEvaluator, ConfidenceLevel
-from rag.contrastive_retrieval import ContrastiveRetriever, NegationDetector
-from rag.multi_hop_retrieval import MultiHopRetriever, QueryDecomposer
+from rag.vectordb import VectorStoreIntegrityError
+from rag.query_classifier import QueryClassifier
+from rag.confidence_evaluator import ConfidenceEvaluator
 from rag.answer_verification import AnswerVerifier
-from rag.feedback_logger import FeedbackLogger, FeedbackType
-from rag.domain_ner import DomainSpecificNER, HybridNER, Domain
+from rag.feedback_logger import FeedbackLogger
 from rag.metadata_store import MetadataStore
 from rag.observability import (
     get_query_logger,
     create_query_log,
-    measure_time,
 )
 from rag.query_router import create_query_router
 from rag.document_summary import get_document_summarizer
-from rag.chunking import apply_contextual_embeddings
+from rag.chunking import apply_contextual_embeddings, resolve_chunking_strategy
 from rag.validation import (
     validate_file_upload,
     validate_query_text,
     validate_top_k,
     validate_chunk_params,
-    validate_temperature,
-    validate_max_tokens,
     validate_collection_id,
     sanitize_filename,
     ValidationError,
 )
-from rag.collections_db import CollectionsDB
-from rag.job_store import JobStore, JobStatus
+from rag.job_store import JobStatus
 from rag.doc_registry import DocRegistry
 
 # Configure logging
@@ -90,12 +81,10 @@ logger.add(
 # ============================================================================
 
 from rag.schemas import (
-    ConversationMessage,
     QueryRequest,
     QueryResponse,
     IngestRequest,
     IngestResponse,
-    StatsResponse,
     AsyncIngestResponse,
     IngestFolderRequest,
 )
@@ -108,7 +97,6 @@ from rag.schemas import (
 # Store singletons live in rag/app_state.py — re-export with the legacy
 # underscore names so existing callers in this module keep working.
 from rag.app_state import (
-    COLLECTIONS_FILE,
     get_collections_db as _get_collections_db,
     get_job_store as _get_job_store,
     get_doc_registry as _get_doc_registry,
@@ -313,6 +301,15 @@ MAX_RERANKER_CACHE = 2
 _reranker_cache: "OrderedDict[str, Any]" = OrderedDict()
 _embedding_model_cache: "OrderedDict[str, Any]" = OrderedDict()
 
+# These caches are touched from two places at once: the event loop (query path)
+# and Starlette's threadpool (sync `/ingest/*` background jobs). Without a lock,
+# concurrent check+insert corrupts the OrderedDict and lets two threads each load
+# the same multi-GB model. Held across check AND load so the second caller waits
+# for the first's model instead of loading a duplicate.
+_embedding_cache_lock = threading.Lock()
+_reranker_cache_lock = threading.Lock()
+_vector_store_lock = threading.Lock()
+
 
 def _evict_lru(cache: "OrderedDict[str, Any]", max_size: int, cache_name: str) -> None:
     """Evict least-recently-used entries until cache fits within max_size.
@@ -353,49 +350,48 @@ def get_or_create_embedding_model(
     Returns:
         Cached or new embedding model instance
     """
-    global _embedding_model_cache
-
     # Use default model if not specified
     model_name = model_name or settings.EMBEDDING_MODEL
 
     # Create cache key from parameters
     cache_key = f"{model_name}|{provider}|{use_ollama}|{use_hybrid}|{use_adaptive}|{structural_weight}"
 
-    # Check cache first
-    if cache_key in _embedding_model_cache:
-        cached_model = _embedding_model_cache[cache_key]
-        _embedding_model_cache.move_to_end(cache_key)
+    with _embedding_cache_lock:
+        # Check cache first
+        if cache_key in _embedding_model_cache:
+            cached_model = _embedding_model_cache[cache_key]
+            _embedding_model_cache.move_to_end(cache_key)
+            logger.info(
+                f"♻️  CACHE HIT: Using cached embedding model: {model_name} on {cached_model.device} (cache size: {len(_embedding_model_cache)})"
+            )
+            return cached_model
+
+        # Create new embedding model
         logger.info(
-            f"♻️  CACHE HIT: Using cached embedding model: {model_name} on {cached_model.device} (cache size: {len(_embedding_model_cache)})"
+            f"🔄 CACHE MISS: Loading embedding model on-demand: {model_name} (will cache for reuse)"
         )
-        return cached_model
+        try:
+            model = create_embedding_model(
+                model_name=model_name,
+                provider=provider,
+                use_ollama=use_ollama,
+                use_hybrid=use_hybrid,
+                use_adaptive=use_adaptive,
+                structural_weight=structural_weight if use_hybrid else None,
+            )
 
-    # Create new embedding model
-    logger.info(
-        f"🔄 CACHE MISS: Loading embedding model on-demand: {model_name} (will cache for reuse)"
-    )
-    try:
-        model = create_embedding_model(
-            model_name=model_name,
-            provider=provider,
-            use_ollama=use_ollama,
-            use_hybrid=use_hybrid,
-            use_adaptive=use_adaptive,
-            structural_weight=structural_weight if use_hybrid else None,
-        )
+            # Cache the model
+            _embedding_model_cache[cache_key] = model
+            _evict_lru(_embedding_model_cache, MAX_EMBEDDING_CACHE, "embedding")
+            logger.info(
+                f"✅ Loaded and cached embedding model: {model_name} on {model.device} (cache size: {len(_embedding_model_cache)})"
+            )
 
-        # Cache the model
-        _embedding_model_cache[cache_key] = model
-        _evict_lru(_embedding_model_cache, MAX_EMBEDDING_CACHE, "embedding")
-        logger.info(
-            f"✅ Loaded and cached embedding model: {model_name} on {model.device} (cache size: {len(_embedding_model_cache)})"
-        )
+            return model
 
-        return model
-
-    except Exception as e:
-        logger.error(f"Failed to load embedding model {model_name}: {e}")
-        raise
+        except Exception as e:
+            logger.error(f"Failed to load embedding model {model_name}: {e}")
+            raise
 
 
 def _get_or_create_vector_store(
@@ -411,25 +407,26 @@ def _get_or_create_vector_store(
     Returns:
         VectorStore instance for the collection
     """
-    global vector_stores
+    with _vector_store_lock:
+        # Check if store already exists for this collection
+        if collection_id in vector_stores:
+            logger.debug(f"Using cached vector store for collection: {collection_id}")
+            return vector_stores[collection_id]
 
-    # Check if store already exists for this collection
-    if collection_id in vector_stores:
-        logger.debug(f"Using cached vector store for collection: {collection_id}")
-        return vector_stores[collection_id]
+        # Create new vector store for this collection
+        logger.info(f"Creating vector store for collection: {collection_id}")
 
-    # Create new vector store for this collection
-    logger.info(f"Creating vector store for collection: {collection_id}")
+        dimension = embedding_dimension or settings.EMBEDDING_DIMENSION
 
-    dimension = embedding_dimension or settings.EMBEDDING_DIMENSION
+        vector_store = create_vector_store(
+            collection_id=collection_id, dimension=dimension
+        )
 
-    vector_store = create_vector_store(collection_id=collection_id, dimension=dimension)
+        # Cache the store
+        vector_stores[collection_id] = vector_store
+        logger.info(f"✓ Created and cached vector store for collection: {collection_id}")
 
-    # Cache the store
-    vector_stores[collection_id] = vector_store
-    logger.info(f"✓ Created and cached vector store for collection: {collection_id}")
-
-    return vector_store
+        return vector_store
 
 
 def get_or_create_reranker(model_name: str):
@@ -443,39 +440,38 @@ def get_or_create_reranker(model_name: str):
     Returns:
         Reranker instance
     """
-    global _reranker_cache
+    with _reranker_cache_lock:
+        # Check cache first
+        if model_name in _reranker_cache:
+            _reranker_cache.move_to_end(model_name)
+            logger.debug(f"Using cached reranker: {model_name}")
+            return _reranker_cache[model_name]
 
-    # Check cache first
-    if model_name in _reranker_cache:
-        _reranker_cache.move_to_end(model_name)
-        logger.debug(f"Using cached reranker: {model_name}")
-        return _reranker_cache[model_name]
+        # Create new reranker instance
+        logger.info(f"Loading reranker on-demand: {model_name}")
+        try:
+            from rag.retrieval import Reranker
 
-    # Create new reranker instance
-    logger.info(f"Loading reranker on-demand: {model_name}")
-    try:
-        from rag.retrieval import Reranker
+            reranker_instance = Reranker(model_name=model_name)
 
-        reranker_instance = Reranker(model_name=model_name)
+            # Cache the instance
+            _reranker_cache[model_name] = reranker_instance
+            _evict_lru(_reranker_cache, MAX_RERANKER_CACHE, "reranker")
+            logger.info(f"✓ Loaded and cached reranker: {model_name}")
 
-        # Cache the instance
-        _reranker_cache[model_name] = reranker_instance
-        _evict_lru(_reranker_cache, MAX_RERANKER_CACHE, "reranker")
-        logger.info(f"✓ Loaded and cached reranker: {model_name}")
-
-        return reranker_instance
-    except Exception as e:
-        logger.error(f"Failed to load reranker '{model_name}': {e}")
-        # Fall back to default reranker if available
-        if (
-            settings.RERANKER_MODEL != model_name
-            and settings.RERANKER_MODEL in _reranker_cache
-        ):
-            logger.warning(
-                f"Falling back to default reranker: {settings.RERANKER_MODEL}"
-            )
-            return _reranker_cache[settings.RERANKER_MODEL]
-        raise
+            return reranker_instance
+        except Exception as e:
+            logger.error(f"Failed to load reranker '{model_name}': {e}")
+            # Fall back to default reranker if available
+            if (
+                settings.RERANKER_MODEL != model_name
+                and settings.RERANKER_MODEL in _reranker_cache
+            ):
+                logger.warning(
+                    f"Falling back to default reranker: {settings.RERANKER_MODEL}"
+                )
+                return _reranker_cache[settings.RERANKER_MODEL]
+            raise
 
 
 @asynccontextmanager
@@ -659,12 +655,16 @@ app.include_router(evaluate_router)
 # ============================================================================
 
 
-async def _execute_rag_pipeline(
+def _execute_rag_pipeline(
     request: QueryRequest,
     query_log: Any,
 ) -> tuple:
     """
     Execute RAG pipeline - shared logic between streaming and non-streaming endpoints
+
+    Synchronous by design: every step here (embedding .encode, vector search,
+    reranking, compression) is CPU/GPU-bound and would stall the event loop.
+    Callers must offload it with `await asyncio.to_thread(...)`.
 
     This function handles the complete retrieval pipeline:
     1. Query contextualization (with conversation history)
@@ -690,6 +690,10 @@ async def _execute_rag_pipeline(
         )
     """
     import time
+
+    # Defined up front so every return path has it — notably the semantic-cache
+    # hit below, which returns before the retrieval steps that re-assign it.
+    retrieval_start = time.time()
 
     # Step 0: Get or create vector store for this collection
     if request.collection_id:
@@ -1479,7 +1483,7 @@ async def query(request: QueryRequest):
             collection_llm_model,
             contextualized_query,
             retrieval_start,
-        ) = await _execute_rag_pipeline(request, query_log)
+        ) = await asyncio.to_thread(_execute_rag_pipeline, request, query_log)
 
         # Handle empty results
         if not chunks_with_scores:
@@ -1501,7 +1505,10 @@ async def query(request: QueryRequest):
         logger.info(f"Generating response with model: {collection_llm_model}...")
         generation_start = time.time()
 
-        answer = current_llm_generator.generate_rag_response(
+        # generate_rag_response uses a synchronous httpx.Client, so a slow LLM
+        # would otherwise block the loop for the whole generation.
+        answer = await asyncio.to_thread(
+            current_llm_generator.generate_rag_response,
             query=request.query,
             chunks_with_scores=chunks_with_scores,
             system_prompt=request.system_prompt,
@@ -1561,6 +1568,10 @@ async def query(request: QueryRequest):
 
         return response
 
+    except HTTPException:
+        # Validation failures already carry the right status code; without
+        # this the handler below would rewrite every 400 into a 500.
+        raise
     except Exception as e:
         logger.error(f"Query error: {e}")
 
@@ -1618,7 +1629,7 @@ async def query_stream(request: QueryRequest):
                 collection_llm_model,
                 contextualized_query,
                 retrieval_start,
-            ) = await _execute_rag_pipeline(request, query_log)
+            ) = await asyncio.to_thread(_execute_rag_pipeline, request, query_log)
 
             # Handle empty results
             if not chunks_with_scores:
@@ -1683,6 +1694,10 @@ async def query_stream(request: QueryRequest):
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
+    except HTTPException:
+        # Validation failures already carry the right status code; without
+        # this the handler below would rewrite every 400 into a 500.
+        raise
     except Exception as e:
         logger.error(f"Streaming query error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1780,121 +1795,229 @@ async def ingest_file(
         # Read file content
         content = await file.read()
 
-        # Document deduplication check
-        effective_collection = collection_title or "default"
-        file_hash = DocRegistry.compute_hash(content)
-        registry = _get_doc_registry()
+        # Everything below is CPU/GPU-bound (parse, chunk, embed, index) and
+        # would stall the event loop. Runs as a closure so it keeps capturing
+        # the form parameters; HTTPExceptions raised inside propagate normally.
+        def _process() -> IngestResponse:
 
-        if settings.SKIP_DUPLICATE_INGESTION and registry.is_duplicate(effective_collection, safe_filename, file_hash):
-            logger.info(f"Skipping duplicate document: {safe_filename} (hash match)")
-            return IngestResponse(
-                success=True,
-                message=f"Document '{safe_filename}' unchanged (identical content), skipping re-ingestion.",
-                stats={"filename": safe_filename, "skipped": True, "num_chunks": 0},
+            # Document deduplication check
+            effective_collection = collection_title or "default"
+            file_hash = DocRegistry.compute_hash(content)
+            registry = _get_doc_registry()
+
+            if settings.SKIP_DUPLICATE_INGESTION and registry.is_duplicate(effective_collection, safe_filename, file_hash):
+                logger.info(f"Skipping duplicate document: {safe_filename} (hash match)")
+                return IngestResponse(
+                    success=True,
+                    message=f"Document '{safe_filename}' unchanged (identical content), skipping re-ingestion.",
+                    stats={"filename": safe_filename, "skipped": True, "num_chunks": 0},
+                )
+
+            # Determine file type
+            doc_type = "pdf" if file.filename.endswith(".pdf") else "markdown"
+
+            # Ingest document
+            document = ingestor.ingest_from_buffer(
+                content=content,
+                filename=file.filename,
+                doc_type=doc_type,
             )
 
-        # Determine file type
-        doc_type = "pdf" if file.filename.endswith(".pdf") else "markdown"
+            logger.info(f"Document ingested: {len(document.content)} characters")
+            if len(document.content) < 50:
+                logger.warning(
+                    f"Document content preview (first 50 chars): {document.content[:50]}"
+                )
+            else:
+                logger.info(f"Document content preview: {document.content[:200]}...")
 
-        # Ingest document
-        document = ingestor.ingest_from_buffer(
-            content=content,
-            filename=file.filename,
-            doc_type=doc_type,
-        )
-
-        logger.info(f"Document ingested: {len(document.content)} characters")
-        if len(document.content) < 50:
-            logger.warning(
-                f"Document content preview (first 50 chars): {document.content[:50]}"
+            # Bound to a separate name: assigning to the captured form
+            # parameter would make it local to _process and raise
+            # UnboundLocalError on the read below.
+            effective_strategy = resolve_chunking_strategy(
+                chunking_strategy, file.filename, document.content
             )
-        else:
-            logger.info(f"Document content preview: {document.content[:200]}...")
 
-        # Implement Smart Chunking Strategy
-        if chunking_strategy == "smart":
-            ext = os.path.splitext(file.filename)[1].lower()
-            if ext in [".md", ".markdown"]:
-                # Check for headers to decide between Markdown and Semantic
-                has_headers = bool(re.search(r"^#+\s", document.content, re.MULTILINE))
-                if has_headers:
-                    chunking_strategy = "markdown"
-                    logger.info(
-                        f"Smart chunking: Selected 'markdown' strategy for {file.filename} (headers found)"
-                    )
+            # Create chunker
+            chunker = create_chunker(
+                strategy=effective_strategy,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                min_chunk_size=settings.MIN_CHUNK_SIZE,
+            )
+
+            # Chunk document
+            chunks = chunker.chunk_document(
+                content=document.content,
+                metadata=document.metadata,
+            )
+
+            logger.info(f"Created {len(chunks)} chunks")
+
+            # Check if any chunks were created
+            if not chunks or len(chunks) == 0:
+                error_msg = f"No chunks created from document '{file.filename}'. "
+                if doc_type == "pdf":
+                    error_msg += "This may be because the PDF is image-based/scanned and OCR is not available. "
+                    error_msg += "Install Tesseract OCR: 'sudo apt-get install tesseract-ocr tesseract-ocr-eng'"
                 else:
-                    chunking_strategy = "semantic"
-                    logger.info(
-                        f"Smart chunking: Selected 'semantic' strategy for {file.filename} (no headers found)"
-                    )
-            elif ext in [
-                ".py",
-                ".js",
-                ".ts",
-                ".tsx",
-                ".jsx",
-                ".java",
-                ".go",
-                ".rs",
-                ".cpp",
-                ".c",
-                ".h",
-            ]:
-                chunking_strategy = "recursive"
+                    error_msg += "The document may be empty or contain no extractable text."
+                logger.error(error_msg)
+                raise HTTPException(status_code=400, detail=error_msg)
+
+            # Incremental diff: if this file was previously ingested, only embed
+            # chunks whose content hash changed, and drop chunks that no longer
+            # appear. Falls back to full re-ingest for legacy records.
+            chunks, ingest_diff, final_chunk_ids, final_chunk_hashes = registry.plan_ingest(
+                effective_collection, safe_filename, chunks
+            )
+            if ingest_diff:
                 logger.info(
-                    f"Smart chunking: Selected 'recursive' strategy for code file {file.filename}"
-                )
-            else:
-                chunking_strategy = "semantic"
-                logger.info(
-                    f"Smart chunking: Selected 'semantic' strategy for {file.filename}"
+                    f"Incremental ingest for {safe_filename}: "
+                    f"{len(ingest_diff.unchanged)} unchanged, "
+                    f"{len(ingest_diff.added)} new, "
+                    f"{len(ingest_diff.removed)} removed"
                 )
 
-        # Create chunker
-        chunker = create_chunker(
-            strategy=chunking_strategy,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=settings.MIN_CHUNK_SIZE,
-        )
+            # Short-circuit: only removals (no new chunks to embed).
+            if ingest_diff and not chunks and ingest_diff.removed:
+                vector_store = _get_or_create_vector_store(collection_title, None)
+                vector_store.delete_by_chunk_ids(ingest_diff.removed)
+                registry.upsert(
+                    effective_collection,
+                    safe_filename,
+                    file_hash,
+                    final_chunk_ids,
+                    final_chunk_hashes,
+                )
+                _update_collection_stats(
+                    collection_title, file.filename, -len(ingest_diff.removed), file_size=len(content)
+                )
+                if llm_model:
+                    _update_collection_model(collection_title, llm_model)
+                return IngestResponse(
+                    success=True,
+                    message=f"Updated {file.filename}: {len(ingest_diff.removed)} chunks removed, nothing new to embed",
+                    stats={
+                        "filename": file.filename,
+                        "num_chunks": len(final_chunk_ids),
+                        "removed": len(ingest_diff.removed),
+                        "doc_type": doc_type,
+                    },
+                )
 
-        # Chunk document
-        chunks = chunker.chunk_document(
-            content=document.content,
-            metadata=document.metadata,
-        )
+            # Short-circuit: diff was fully unchanged — refresh file_hash only.
+            if ingest_diff and not chunks and not ingest_diff.removed:
+                registry.upsert(
+                    effective_collection,
+                    safe_filename,
+                    file_hash,
+                    final_chunk_ids,
+                    final_chunk_hashes,
+                )
+                return IngestResponse(
+                    success=True,
+                    message=f"Document '{safe_filename}' chunks unchanged; refreshed file hash.",
+                    stats={"filename": safe_filename, "num_chunks": len(final_chunk_ids), "skipped": True},
+                )
 
-        logger.info(f"Created {len(chunks)} chunks")
+            # Apply contextual embeddings if enabled
+            if settings.USE_CONTEXTUAL_EMBEDDINGS:
+                logger.info("Generating document summary for contextual embeddings...")
 
-        # Check if any chunks were created
-        if not chunks or len(chunks) == 0:
-            error_msg = f"No chunks created from document '{file.filename}'. "
-            if doc_type == "pdf":
-                error_msg += "This may be because the PDF is image-based/scanned and OCR is not available. "
-                error_msg += "Install Tesseract OCR: 'sudo apt-get install tesseract-ocr tesseract-ocr-eng'"
-            else:
-                error_msg += "The document may be empty or contain no extractable text."
-            logger.error(error_msg)
-            raise HTTPException(status_code=400, detail=error_msg)
+                # Get document summarizer
+                summarizer = get_document_summarizer(llm_generator=llm_generator)
 
-        # Incremental diff: if this file was previously ingested, only embed
-        # chunks whose content hash changed, and drop chunks that no longer
-        # appear. Falls back to full re-ingest for legacy records.
-        chunks, ingest_diff, final_chunk_ids, final_chunk_hashes = registry.plan_ingest(
-            effective_collection, safe_filename, chunks
-        )
-        if ingest_diff:
+                # Generate summary
+                document_title = document.metadata.get("filename", file.filename)
+                doc_summary = summarizer.summarize(
+                    content=document.content,
+                    title=document_title,
+                )
+
+                # Apply contextual embeddings
+                chunks = apply_contextual_embeddings(
+                    chunks=chunks,
+                    document_summary=doc_summary,
+                    document_title=document_title,
+                )
+
+                logger.info(
+                    f"Applied contextual embeddings with summary: {doc_summary[:100]}..."
+                )
+
+            # Generate embeddings with specified model
+            model_desc = f"{embedding_model_name or 'default model'}"
+            if use_adaptive_fusion:
+                model_desc += " (adaptive fusion)"
+            elif use_hybrid_embedding:
+                model_desc += f" (hybrid, {structural_weight:.0%} structural)"
+            if settings.USE_CONTEXTUAL_EMBEDDINGS:
+                model_desc += " (contextual)"
+            logger.info(f"Generating embeddings with {model_desc}...")
+
+            # Get or create embedding model (cached to prevent memory leaks)
+            logger.info(f"📊 Getting embedding model for {len(chunks)} chunks...")
+            embedding_model_to_use = get_or_create_embedding_model(
+                model_name=embedding_model_name,
+                provider=embedding_provider,
+                use_ollama=use_ollama_embedding,
+                use_hybrid=use_hybrid_embedding,
+                use_adaptive=use_adaptive_fusion,
+                structural_weight=structural_weight,
+            )
             logger.info(
-                f"Incremental ingest for {safe_filename}: "
-                f"{len(ingest_diff.unchanged)} unchanged, "
-                f"{len(ingest_diff.added)} new, "
-                f"{len(ingest_diff.removed)} removed"
+                f"🚀 Starting embedding encoding on device: {embedding_model_to_use.device}"
             )
 
-        # Short-circuit: only removals (no new chunks to embed).
-        if ingest_diff and not chunks and ingest_diff.removed:
-            vector_store = _get_or_create_vector_store(collection_title, None)
-            vector_store.delete_by_chunk_ids(ingest_diff.removed)
+            # Use content_for_embedding if available (contextual embeddings)
+            texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
+            embeddings = embedding_model_to_use.encode(texts, show_progress=True)
+
+            logger.info(f"✅ Finished encoding {len(chunks)} chunks into embeddings")
+
+            # Add embeddings to chunks
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk.embedding = embedding.tolist()
+
+            # Get actual embedding dimension from the embeddings we just created
+            actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
+
+            # Free GPU memory after embedding encoding
+            del embeddings
+            del texts
+
+            if _is_big_document(document):
+                logger.info(
+                    f"🧹 Triggering memory cleanup for big document: {document.metadata.get('filename')}"
+                )
+                _cleanup_gpu_memory()
+
+            # Get or create collection first (to get dimension)
+            _get_or_create_collection(
+                collection_id=collection_title,
+                title=collection_title,
+                llm_model=llm_model or settings.LLM_MODEL,
+                embedding_model=embedding_model_name or settings.EMBEDDING_MODEL,
+                embedding_dimension=actual_dimension,
+            )
+
+            # Get or create vector store for this collection
+            logger.info(f"Getting vector store for collection: {collection_title}")
+            vector_store = _get_or_create_vector_store(collection_title, actual_dimension)
+
+            # Drop stale chunks before adding the new ones so chunk_id re-use is safe.
+            if ingest_diff and ingest_diff.removed:
+                vector_store.delete_by_chunk_ids(ingest_diff.removed)
+
+            # Index chunks in vector store
+            logger.info("Indexing chunks in vector store...")
+            vector_store.add_chunks(chunks)
+            _update_collection_stats(
+                collection_title, file.filename, len(chunks), file_size=len(content)
+            )
+
+            # Register document hash for future deduplication
             registry.upsert(
                 effective_collection,
                 safe_filename,
@@ -1902,157 +2025,28 @@ async def ingest_file(
                 final_chunk_ids,
                 final_chunk_hashes,
             )
-            _update_collection_stats(
-                collection_title, file.filename, -len(ingest_diff.removed), file_size=len(content)
-            )
+
+            # Update collection LLM model if provided
             if llm_model:
                 _update_collection_model(collection_title, llm_model)
+
             return IngestResponse(
                 success=True,
-                message=f"Updated {file.filename}: {len(ingest_diff.removed)} chunks removed, nothing new to embed",
+                message=f"Successfully ingested {file.filename}",
                 stats={
                     "filename": file.filename,
-                    "num_chunks": len(final_chunk_ids),
-                    "removed": len(ingest_diff.removed),
+                    "num_chunks": len(chunks),
                     "doc_type": doc_type,
+                    "embedding_model": embedding_model_name or settings.EMBEDDING_MODEL,
                 },
             )
 
-        # Short-circuit: diff was fully unchanged — refresh file_hash only.
-        if ingest_diff and not chunks and not ingest_diff.removed:
-            registry.upsert(
-                effective_collection,
-                safe_filename,
-                file_hash,
-                final_chunk_ids,
-                final_chunk_hashes,
-            )
-            return IngestResponse(
-                success=True,
-                message=f"Document '{safe_filename}' chunks unchanged; refreshed file hash.",
-                stats={"filename": safe_filename, "num_chunks": len(final_chunk_ids), "skipped": True},
-            )
+        return await asyncio.to_thread(_process)
 
-        # Apply contextual embeddings if enabled
-        if settings.USE_CONTEXTUAL_EMBEDDINGS:
-            logger.info("Generating document summary for contextual embeddings...")
-
-            # Get document summarizer
-            summarizer = get_document_summarizer(llm_generator=llm_generator)
-
-            # Generate summary
-            document_title = document.metadata.get("filename", file.filename)
-            doc_summary = summarizer.summarize(
-                content=document.content,
-                title=document_title,
-            )
-
-            # Apply contextual embeddings
-            chunks = apply_contextual_embeddings(
-                chunks=chunks,
-                document_summary=doc_summary,
-                document_title=document_title,
-            )
-
-            logger.info(
-                f"Applied contextual embeddings with summary: {doc_summary[:100]}..."
-            )
-
-        # Generate embeddings with specified model
-        model_desc = f"{embedding_model_name or 'default model'}"
-        if use_adaptive_fusion:
-            model_desc += " (adaptive fusion)"
-        elif use_hybrid_embedding:
-            model_desc += f" (hybrid, {structural_weight:.0%} structural)"
-        if settings.USE_CONTEXTUAL_EMBEDDINGS:
-            model_desc += " (contextual)"
-        logger.info(f"Generating embeddings with {model_desc}...")
-
-        # Get or create embedding model (cached to prevent memory leaks)
-        logger.info(f"📊 Getting embedding model for {len(chunks)} chunks...")
-        embedding_model_to_use = get_or_create_embedding_model(
-            model_name=embedding_model_name,
-            provider=embedding_provider,
-            use_ollama=use_ollama_embedding,
-            use_hybrid=use_hybrid_embedding,
-            use_adaptive=use_adaptive_fusion,
-            structural_weight=structural_weight,
-        )
-        logger.info(
-            f"🚀 Starting embedding encoding on device: {embedding_model_to_use.device}"
-        )
-
-        # Use content_for_embedding if available (contextual embeddings)
-        texts = [chunk.content_for_embedding or chunk.content for chunk in chunks]
-        embeddings = embedding_model_to_use.encode(texts, show_progress=True)
-
-        logger.info(f"✅ Finished encoding {len(chunks)} chunks into embeddings")
-
-        # Add embeddings to chunks
-        for chunk, embedding in zip(chunks, embeddings):
-            chunk.embedding = embedding.tolist()
-
-        # Get actual embedding dimension from the embeddings we just created
-        actual_dimension = embeddings.shape[1] if len(embeddings) > 0 else None
-
-        # Free GPU memory after embedding encoding
-        del embeddings
-        del texts
-
-        if _is_big_document(document):
-            logger.info(
-                f"🧹 Triggering memory cleanup for big document: {document.metadata.get('filename')}"
-            )
-            _cleanup_gpu_memory()
-
-        # Get or create collection first (to get dimension)
-        _get_or_create_collection(
-            collection_id=collection_title,
-            title=collection_title,
-            llm_model=llm_model or settings.LLM_MODEL,
-            embedding_model=embedding_model_name or settings.EMBEDDING_MODEL,
-            embedding_dimension=actual_dimension,
-        )
-
-        # Get or create vector store for this collection
-        logger.info(f"Getting vector store for collection: {collection_title}")
-        vector_store = _get_or_create_vector_store(collection_title, actual_dimension)
-
-        # Drop stale chunks before adding the new ones so chunk_id re-use is safe.
-        if ingest_diff and ingest_diff.removed:
-            vector_store.delete_by_chunk_ids(ingest_diff.removed)
-
-        # Index chunks in vector store
-        logger.info("Indexing chunks in vector store...")
-        vector_store.add_chunks(chunks)
-        _update_collection_stats(
-            collection_title, file.filename, len(chunks), file_size=len(content)
-        )
-
-        # Register document hash for future deduplication
-        registry.upsert(
-            effective_collection,
-            safe_filename,
-            file_hash,
-            final_chunk_ids,
-            final_chunk_hashes,
-        )
-
-        # Update collection LLM model if provided
-        if llm_model:
-            _update_collection_model(collection_title, llm_model)
-
-        return IngestResponse(
-            success=True,
-            message=f"Successfully ingested {file.filename}",
-            stats={
-                "filename": file.filename,
-                "num_chunks": len(chunks),
-                "doc_type": doc_type,
-                "embedding_model": embedding_model_name or settings.EMBEDDING_MODEL,
-            },
-        )
-
+    except HTTPException:
+        # Validation failures already carry the right status code; without
+        # this the handler below would rewrite every 400 into a 500.
+        raise
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2109,7 +2103,10 @@ async def ingest_file_async(
             _get_job_store().update(job_id, JobStatus.RUNNING, progress=0.2)
 
             chunker = create_chunker(
-                strategy=chunking_strategy, chunk_size=chunk_size,
+                strategy=resolve_chunking_strategy(
+                    chunking_strategy, filename, document.content
+                ),
+                chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap, min_chunk_size=settings.MIN_CHUNK_SIZE,
             )
             chunks = chunker.chunk_document(content=document.content, metadata=document.metadata)
@@ -2197,7 +2194,7 @@ async def ingest_file_async(
 
 
 @app.post("/ingest/folder", response_model=AsyncIngestResponse)
-async def ingest_folder(
+def ingest_folder(
     request: IngestFolderRequest,
     background_tasks: BackgroundTasks,
 ):
@@ -2205,7 +2202,6 @@ async def ingest_folder(
     Ingest all PDF and Markdown files from a local folder on the server.
     Runs as a background job. Returns job_id immediately.
     """
-    import os
     folder = Path(request.folder_path)
 
     if not folder.exists():
@@ -2259,7 +2255,11 @@ async def ingest_folder(
                     document = ingestor.ingest_from_buffer(content=content, filename=file_path.name, doc_type=doc_type)
 
                     chunker = create_chunker(
-                        strategy=request.chunking_strategy,
+                        strategy=resolve_chunking_strategy(
+                            request.chunking_strategy,
+                            file_path.name,
+                            document.content,
+                        ),
                         chunk_size=request.chunk_size,
                         chunk_overlap=request.chunk_overlap,
                         min_chunk_size=settings.MIN_CHUNK_SIZE,
@@ -2323,7 +2323,7 @@ async def ingest_folder(
 
 
 @app.post("/ingest/url", response_model=IngestResponse)
-async def ingest_url(
+def ingest_url(
     url: str = Form(...),
     collection_title: str = Form(...),
     llm_model: Optional[str] = Form(None),
@@ -2358,9 +2358,14 @@ async def ingest_url(
         # Ingest URL
         document = ingestor.ingest_url(url)
 
-        # Create chunker
+        # Create chunker. A URL rarely carries a usable extension, so "smart"
+        # will normally resolve to semantic here.
         chunker = create_chunker(
-            strategy=chunking_strategy,
+            strategy=resolve_chunking_strategy(
+                chunking_strategy,
+                document.metadata.get("filename") or url,
+                document.content,
+            ),
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             min_chunk_size=settings.MIN_CHUNK_SIZE,
@@ -2473,13 +2478,17 @@ async def ingest_url(
             },
         )
 
+    except HTTPException:
+        # Validation failures already carry the right status code; without
+        # this the handler below would rewrite every 400 into a 500.
+        raise
     except Exception as e:
         logger.error(f"URL ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ingest/directory", response_model=IngestResponse)
-async def ingest_directory(
+def ingest_directory(
     request: IngestRequest,
     background_tasks: BackgroundTasks,
 ):
@@ -2497,20 +2506,25 @@ async def ingest_directory(
                 recursive=request.recursive,
             )
 
-            # Create chunker
-            chunker = create_chunker(
-                strategy=request.chunking_strategy,
-                chunk_size=request.chunk_size,
-                chunk_overlap=request.chunk_overlap,
-                min_chunk_size=settings.MIN_CHUNK_SIZE,
-            )
-
             # Get or create embedding model (cached)
             embedding_model_to_use = get_or_create_embedding_model()
 
             # Process each document
             total_chunks = 0
             for doc in documents:
+                # Built per document: "smart" resolves from each file's own
+                # extension and content, so one shared chunker would not do.
+                chunker = create_chunker(
+                    strategy=resolve_chunking_strategy(
+                        request.chunking_strategy,
+                        doc.metadata.get("filename"),
+                        doc.content,
+                    ),
+                    chunk_size=request.chunk_size,
+                    chunk_overlap=request.chunk_overlap,
+                    min_chunk_size=settings.MIN_CHUNK_SIZE,
+                )
+
                 # Chunk
                 chunks = chunker.chunk_document(doc.content, doc.metadata)
 
@@ -2549,26 +2563,34 @@ async def ingest_directory(
             stats={"status": "processing"},
         )
 
+    except HTTPException:
+        # Validation failures already carry the right status code; without
+        # this the handler below would rewrite every 400 into a 500.
+        raise
     except Exception as e:
         logger.error(f"Directory ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/collections")
-async def list_collections():
+def list_collections():
     """List all RAG collections"""
     try:
         collections = _load_collections()
         collection_list = list(collections.values())
         return {"collections": collection_list, "total": len(collection_list)}
 
+    except HTTPException:
+        # Validation failures already carry the right status code; without
+        # this the handler below would rewrite every 400 into a 500.
+        raise
     except Exception as e:
         logger.error(f"List collections error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/collections/{collection_id}")
-async def get_collection(collection_id: str):
+def get_collection(collection_id: str):
     """Get a specific RAG collection"""
     try:
         collections = _load_collections()
@@ -2586,7 +2608,7 @@ async def get_collection(collection_id: str):
 
 
 @app.patch("/collections/{collection_id}")
-async def update_collection(
+def update_collection(
     collection_id: str,
     title: Optional[str] = None,
     llm_model: Optional[str] = None,
@@ -2662,7 +2684,7 @@ async def update_collection(
 
 
 @app.delete("/collections/{collection_id}/documents/{filename}")
-async def delete_document_from_collection(collection_id: str, filename: str):
+def delete_document_from_collection(collection_id: str, filename: str):
     """
     Delete a specific document from a collection
 
@@ -2696,6 +2718,11 @@ async def delete_document_from_collection(collection_id: str, filename: str):
             logger.info(
                 f"Deleted chunks for file: {filename} from collection {collection_id}"
             )
+        except VectorStoreIntegrityError as e:
+            # Refused rather than silently wiping the index — collection metadata
+            # is left untouched so the state stays consistent.
+            logger.error(f"Refused to delete {filename} from {collection_id}: {e}")
+            raise HTTPException(status_code=409, detail=str(e))
         except Exception as e:
             logger.error(f"Failed to delete chunks for file {filename}: {e}")
             raise HTTPException(
@@ -2729,7 +2756,7 @@ async def delete_document_from_collection(collection_id: str, filename: str):
 
 
 @app.get("/collections/{collection_id}/urls")
-async def list_collection_urls(collection_id: str):
+def list_collection_urls(collection_id: str):
     """
     List all URLs ingested in a collection
 
@@ -2767,7 +2794,7 @@ async def list_collection_urls(collection_id: str):
 
 
 @app.delete("/collections/{collection_id}")
-async def delete_collection(collection_id: str):
+def delete_collection(collection_id: str):
     """Delete a RAG collection and its associated vector store data"""
     try:
         from pathlib import Path
@@ -2778,7 +2805,6 @@ async def delete_collection(collection_id: str):
         if collection_id not in collections:
             raise HTTPException(status_code=404, detail="Collection not found")
 
-        collection = collections[collection_id]
         deleted_files = []
 
         # Delete vector store for this collection
@@ -2992,7 +3018,8 @@ def _get_all_chunks_from_store(vector_store, collection_id: str) -> List:
                                         i
                                     )
                                     embeddings_available = True
-                                except:
+                                except Exception:
+                                    # HNSW indexes do not support reconstruct()
                                     embeddings_available = False
                                     break
 
@@ -3081,7 +3108,7 @@ def _get_all_chunks_from_store(vector_store, collection_id: str) -> List:
 
 
 @app.get("/collections/{collection_id}/graph")
-async def get_collection_graph(collection_id: str):
+def get_collection_graph(collection_id: str):
     """
     Get Graph RAG visualization data for a collection
 
@@ -3188,7 +3215,7 @@ async def get_collection_graph(collection_id: str):
 
 
 @app.get("/collections/{collection_id}/umap")
-async def get_collection_umap(
+def get_collection_umap(
     collection_id: str,
     n_components: int = 2,
     n_neighbors: int = 15,
@@ -3313,7 +3340,7 @@ async def get_collection_umap(
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        "rag.main:app",
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.RELOAD,

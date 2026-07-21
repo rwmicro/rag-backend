@@ -18,7 +18,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from rag.chunking import Chunk
-from rag.vectordb import FAISSStore
+from rag.vectordb import FAISSStore, VectorStoreIntegrityError
 
 
 def _chunk(cid: str, vec, meta=None):
@@ -68,6 +68,44 @@ def test_delete_by_chunk_ids_empty_input_is_noop(tmp_path):
 
     store.delete_by_chunk_ids([])
     assert store.index.ntotal == 1
+
+
+def test_delete_refuses_when_embeddings_missing(tmp_path):
+    """Without stored embeddings the rebuild would empty the index — refuse instead."""
+    index_path = str(tmp_path / "test.faiss")
+    store = FAISSStore(dimension=3, index_path=index_path)
+    store.add_chunks([
+        _chunk("c0", [1.0, 0.0, 0.0]),
+        _chunk("c1", [0.0, 1.0, 0.0]),
+    ])
+
+    # Simulate a missing/unreadable .embeddings.npy (older index, failed load, …)
+    store.stored_embeddings = None
+
+    with pytest.raises(VectorStoreIntegrityError, match="missing"):
+        store.delete_by_chunk_ids(["c0"])
+
+    # Nothing was destroyed or half-mutated.
+    assert store.index.ntotal == 2
+    assert {m["chunk_id"] for m in store.chunks_metadata} == {"c0", "c1"}
+
+
+def test_delete_refuses_when_embeddings_out_of_sync(tmp_path):
+    """Length mismatch means the keep-mask can't be trusted — refuse."""
+    index_path = str(tmp_path / "test.faiss")
+    store = FAISSStore(dimension=3, index_path=index_path)
+    store.add_chunks([
+        _chunk("c0", [1.0, 0.0, 0.0]),
+        _chunk("c1", [0.0, 1.0, 0.0]),
+    ])
+
+    store.stored_embeddings = store.stored_embeddings[:1]
+
+    with pytest.raises(VectorStoreIntegrityError, match="out of sync"):
+        store.delete_by_chunk_ids(["c0"])
+
+    assert store.index.ntotal == 2
+    assert len(store.chunks_metadata) == 2
 
 
 def test_delete_then_re_add_same_id_works(tmp_path):

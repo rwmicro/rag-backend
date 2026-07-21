@@ -17,7 +17,6 @@ import numpy as np
 from loguru import logger
 
 from .chunking import Chunk
-from config.settings import settings
 
 
 class VerificationStatus(Enum):

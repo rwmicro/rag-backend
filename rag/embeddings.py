@@ -40,27 +40,28 @@ class EmbeddingModel:
         # Auto-detect device if not specified
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device.startswith("cuda") and not torch.cuda.is_available():
+            # EMBEDDING_DEVICE defaults to "cuda", so an explicit value reaches
+            # here on CPU-only hosts too. Degrade instead of hard-crashing.
+            logger.warning(
+                f"{device!r} requested but no CUDA device is available; falling back to CPU"
+            )
+            device = "cpu"
         self.device = device
 
         logger.info(f"Loading embedding model: {model_name} on {device}")
 
         # Load model
         try:
-            # Load model with FP16 optimization for RTX GPUs
-            model_kwargs = {}
-            if device == "cuda":
-                # Enable FP16 (half precision) for 2-3x speedup on modern GPUs
-                model_kwargs = {
-                    "dtype": torch.float16,
-                }
-                logger.info("Enabling FP16 mixed precision for faster GPU inference")
+            # SentenceTransformer only accepts model_kwargs from 3.0 onwards, and
+            # requirements.txt pins <3.0 — passing it raised TypeError on every
+            # model load. Convert after loading instead, which works on both.
+            self.model = SentenceTransformer(model_name, device=device)
 
-            # Load model with optimizations
-            self.model = SentenceTransformer(
-                model_name,
-                device=device,
-                model_kwargs=model_kwargs,
-            )
+            if device == "cuda":
+                # FP16 (half precision) gives a 2-3x speedup on modern GPUs.
+                self.model = self.model.half()
+                logger.info("Enabling FP16 mixed precision for faster GPU inference")
 
             # Get embedding dimension
             self.dimension = self.model.get_sentence_embedding_dimension()
