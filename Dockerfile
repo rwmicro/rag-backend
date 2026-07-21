@@ -135,4 +135,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 EXPOSE 8001
 
 # Run application (CPU mode)
-CMD ["uvicorn", "rag.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]
+# --workers must stay 1: the FAISS index and its metadata are in-process state
+# flushed to ./data/faiss/*. A second worker would hold a divergent copy of the
+# same collection and clobber the first's writes. Scale with threads, not workers.
+CMD ["uvicorn", "rag.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
