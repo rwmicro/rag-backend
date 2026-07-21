@@ -2,40 +2,23 @@
 Tests for Collection Management
 """
 
-import pytest
-import json
-import os
 from pathlib import Path
-import tempfile
-import shutil
+
+import pytest
 
 # Add parent directory to path for imports
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config.settings import settings
-
 
 class TestCollectionManagement:
     """Test collection CRUD operations"""
 
-    @pytest.fixture(autouse=True)
-    def setup_teardown(self):
-        """Setup and teardown for each test"""
-        # Create temp directory for test data
-        self.test_dir = tempfile.mkdtemp()
-        self.collections_file = os.path.join(self.test_dir, "collections.json")
-
-        # Mock the collections file path
-        import rag.main as main_module
-        self.original_collections_file = main_module.COLLECTIONS_FILE
-        main_module.COLLECTIONS_FILE = self.collections_file
-
-        yield
-
-        # Cleanup
-        main_module.COLLECTIONS_FILE = self.original_collections_file
-        shutil.rmtree(self.test_dir, ignore_errors=True)
+    # Isolation comes from the autouse `isolate_data_stores` fixture in
+    # conftest.py, which redirects the SQLite stores these helpers actually
+    # write to. A previous fixture here redirected main.COLLECTIONS_FILE — the
+    # legacy JSON path, which no longer backs anything — so it looked isolated
+    # while every test leaked into the real ./data/collections.db.
 
     def test_load_empty_collections(self):
         """Test loading collections when file doesn't exist"""

@@ -4,7 +4,6 @@ Run with: pytest tests/test_integration.py -v -m integration
 Skip by default in CI: pytest -m "not integration"
 """
 import pytest
-import asyncio
 from pathlib import Path
 
 
@@ -32,16 +31,40 @@ The Eiffel Tower was built in 1889 for the World Fair.
 """
 
 
+@pytest.fixture(scope="module", autouse=True)
+def isolated_data_dir(tmp_path_factory):
+    """Isolate the data stores once for the whole module.
+
+    The tests below are a sequence — ingest, re-ingest to check dedup, query,
+    delete — all against one collection, so they must share a data dir. The
+    per-test isolation in conftest.py steps aside for the `integration` marker.
+    """
+    from conftest import redirect_data_stores
+
+    with redirect_data_stores(tmp_path_factory.mktemp("integration") / "data"):
+        yield
+
+
 @pytest.fixture(scope="module")
-def app_client():
-    """Create test client for the FastAPI app"""
+def app_client(isolated_data_dir):
+    """Create test client for the FastAPI app.
+
+    TestClient must be entered as a context manager: that is what runs the
+    lifespan handler. Without it the module-level singletons (ingestor,
+    llm_generator, …) stay None and every ingest/query endpoint 500s on
+    "'NoneType' object has no attribute ...".
+    """
     try:
         from fastapi.testclient import TestClient
         from rag.main import app
-        client = TestClient(app)
-        return client
     except Exception as e:
-        pytest.skip(f"Could not create test client: {e}")
+        pytest.skip(f"Could not import app: {e}")
+
+    try:
+        with TestClient(app) as client:
+            yield client
+    except Exception as e:
+        pytest.skip(f"Could not start app lifespan: {e}")
 
 
 class TestCollectionsCRUD:

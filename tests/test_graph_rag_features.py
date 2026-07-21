@@ -6,7 +6,6 @@ Test Graph RAG Features:
 """
 
 import sys
-import os
 from pathlib import Path
 
 # Add backend to path
@@ -45,9 +44,12 @@ def test_spacy_ner_extraction():
         Tim Cook became CEO after Steve Jobs passed away in 2011.
         Microsoft and Google are major competitors in the technology sector.
         """,
-        metadata={"title": "Tech Companies", "section": "History"},
-        doc_id="doc_1",
-        position=0,
+        metadata={
+            "title": "Tech Companies",
+            "section": "History",
+            "doc_id": "doc_1",
+            "position": 0,
+        },
     )
 
     # Extract entities
@@ -123,9 +125,7 @@ def test_graph_caching():
             Chunk(
                 chunk_id=f"chunk_{i}",
                 content=f"This is test chunk {i} about Apple Inc. and Steve Jobs.",
-                metadata={"title": f"Document {i}"},
-                doc_id="doc_1",
-                position=i,
+                metadata={"title": f"Document {i}", "doc_id": "doc_1", "position": i},
             )
             for i in range(3)
         ]
@@ -150,7 +150,7 @@ def test_graph_caching():
         if cache_path.exists():
             print(f"  ✓ Cache file exists ({cache_path.stat().st_size} bytes)")
         else:
-            print(f"  ✗ Cache file NOT found!")
+            print("  ✗ Cache file NOT found!")
             return False
 
         # Create new Graph RAG instance
@@ -161,21 +161,21 @@ def test_graph_caching():
             cache_dir=temp_cache_dir,
         )
 
-        print(f"\n→ Loading graph from cache...")
+        print("\n→ Loading graph from cache...")
         loaded = graph_rag_2.load_cache("test_cache")
 
         if not loaded:
             print("  ✗ Failed to load cache!")
             return False
 
-        print(f"  ✓ Cache loaded successfully")
+        print("  ✓ Cache loaded successfully")
 
         # Verify state matches
         loaded_num_nodes = graph_rag_2.graph.number_of_nodes()
         loaded_num_edges = graph_rag_2.graph.number_of_edges()
         loaded_num_entities = len(graph_rag_2.entities)
 
-        print(f"\n→ Comparing original vs loaded:")
+        print("\n→ Comparing original vs loaded:")
         print(f"  Nodes:    {original_num_nodes} -> {loaded_num_nodes} {'✓' if original_num_nodes == loaded_num_nodes else '✗'}")
         print(f"  Edges:    {original_num_edges} -> {loaded_num_edges} {'✓' if original_num_edges == loaded_num_edges else '✗'}")
         print(f"  Entities: {original_num_entities} -> {loaded_num_entities} {'✓' if original_num_entities == loaded_num_entities else '✗'}")
@@ -187,7 +187,7 @@ def test_graph_caching():
             return False
 
         # Test cache clearing
-        print(f"\n→ Testing cache clear...")
+        print("\n→ Testing cache clear...")
         graph_rag_2.clear_cache("test_cache")
         if not cache_path.exists():
             print("  ✓ Cache cleared successfully")
@@ -201,7 +201,7 @@ def test_graph_caching():
     finally:
         # Clean up temp directory
         shutil.rmtree(temp_cache_dir, ignore_errors=True)
-        print(f"✓ Cleaned up temp cache dir")
+        print("✓ Cleaned up temp cache dir")
 
 
 def test_integration_with_build_graph():
@@ -222,10 +222,8 @@ def test_integration_with_build_graph():
         chunks = [
             Chunk(
                 chunk_id=f"chunk_{i}",
-                content=f"Microsoft was founded by Bill Gates and Paul Allen in Seattle, Washington.",
-                metadata={"title": f"Tech History {i}"},
-                doc_id="doc_1",
-                position=i,
+                content="Microsoft was founded by Bill Gates and Paul Allen in Seattle, Washington.",
+                metadata={"title": f"Tech History {i}", "doc_id": "doc_1", "position": i},
             )
             for i in range(2)
         ]
@@ -279,7 +277,7 @@ def test_integration_with_build_graph():
     finally:
         # Clean up
         shutil.rmtree(temp_cache_dir, ignore_errors=True)
-        print(f"✓ Cleaned up temp cache dir")
+        print("✓ Cleaned up temp cache dir")
 
 
 def main():
