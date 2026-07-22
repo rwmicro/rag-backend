@@ -562,6 +562,30 @@ class FAISSStore(VectorStore):
         """Check if metadata matches the filter criteria"""
         return MetadataFilter.matches(metadata, filter_dict)
 
+    def get_chunks_by_filename(self, filename: str) -> List[Chunk]:
+        """Return every chunk of a document, in original order.
+
+        Used by document pinning to reconstruct a full document from its
+        chunks (there is no separate full-text store). Ordered by the
+        chunk_index each chunker writes into metadata.
+        """
+        with self._lock:
+            entries = [
+                m
+                for m in self.chunks_metadata
+                if m["metadata"].get("filename") == filename
+            ]
+
+        entries.sort(key=lambda m: m["metadata"].get("chunk_index", 0))
+        return [
+            Chunk(
+                chunk_id=m["chunk_id"],
+                content=m["content"],
+                metadata=m["metadata"],
+            )
+            for m in entries
+        ]
+
     def delete_by_filename(self, filename: str) -> None:
         """Delete chunks by filename (requires rebuilding the HNSW index)."""
         with self._lock:
