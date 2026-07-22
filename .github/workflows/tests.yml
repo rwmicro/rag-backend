@@ -1,0 +1,62 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit tests (offline subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned deps (numpy<2, torch<2.10, sentence-transformers<3.0) have no
+          # wheels beyond 3.12 — the same reason the suite cannot run on a
+          # recent host Python.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          # The default PyPI torch wheel bundles CUDA (~800 MB of dead weight
+          # here); the cpu index keeps the install small and fast.
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r requirements.txt
+          pip install -r requirements-dev.txt "httpx<0.28"
+
+      - name: Run offline test suite
+        # Excluded: integration tests and graph-RAG tests download multi-GB
+        # models (e5-large, bge-reranker, spacy) — run those in the Docker
+        # image locally (see README "Tests"). Everything else must be green.
+        run: |
+          pytest tests/ -q \
+            -m "not integration" \
+            --ignore=tests/test_graph_rag_features.py \
+            --junitxml=pytest-report.xml
+
+      - name: Publish test summary
+        if: always()
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET
+          try:
+              root = ET.parse("pytest-report.xml").getroot()
+              ts = root[0] if root.tag == "testsuites" else root
+              print(f"**{ts.get('tests')}** tests — "
+                    f"{ts.get('failures')} failures, {ts.get('errors')} errors, "
+                    f"{ts.get('skipped')} skipped")
+          except Exception as e:
+              print(f"no report parsed: {e}")
+          EOF
