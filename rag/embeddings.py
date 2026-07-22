@@ -108,6 +108,8 @@ class EmbeddingModel:
         if not texts:
             return np.array([])
 
+        self._warn_if_truncating(texts)
+
         try:
             # Ensure model is on correct device (prevents CPU fallback)
             if self.device == "cuda":
@@ -139,6 +141,46 @@ class EmbeddingModel:
         except Exception as e:
             logger.error(f"Unexpected error encoding texts: {e}")
             raise
+
+    def _warn_if_truncating(self, texts: List[str]) -> None:
+        """Warn when texts exceed the model's token limit and will be cut.
+
+        SentenceTransformer truncates silently at max_seq_length, so an
+        oversized chunk is embedded from its first ~max_seq tokens only —
+        the rest is invisible to retrieval while still being fed to the LLM.
+        This surfaced with CHUNK_SIZE=1000 against e5-large's 512-token limit.
+        """
+        max_seq = getattr(self.model, "max_seq_length", None)
+        if not max_seq:
+            return
+
+        # Cheap char-length pre-filter (a token is practically never < 2 chars),
+        # so we only pay for exact tokenization on plausible offenders.
+        suspects = [t for t in texts if len(t) > 2 * max_seq]
+        if not suspects:
+            return
+
+        tokenizer = getattr(self.model, "tokenizer", None)
+        if tokenizer is None:
+            return
+
+        over = 0
+        worst = 0
+        for text in suspects:
+            n_tokens = len(tokenizer(text, truncation=False)["input_ids"])
+            if n_tokens > max_seq:
+                over += 1
+                worst = max(worst, n_tokens)
+
+        if over:
+            logger.warning(
+                f"⚠️  {over}/{len(texts)} text(s) exceed this embedder's "
+                f"{max_seq}-token limit (longest: {worst} tokens) and will be "
+                f"silently truncated — retrieval only sees the first {max_seq} "
+                f"tokens of each. Lower CHUNK_SIZE below the limit "
+                f"(current setting: {settings.CHUNK_SIZE})."
+            )
+
 
     def encode_single(self, text: str, is_query: bool = False) -> np.ndarray:
         """

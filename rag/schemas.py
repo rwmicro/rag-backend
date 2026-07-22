@@ -8,6 +8,8 @@ are small and tightly coupled to the public HTTP surface.
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
+from config.settings import settings
+
 
 class ConversationMessage(BaseModel):
     """Message in conversation history"""
@@ -167,8 +169,8 @@ class IngestRequest(BaseModel):
     """Request model for /ingest endpoint"""
 
     recursive: bool = Field(True, description="Process subdirectories recursively")
-    chunk_size: int = Field(1000, description="Target chunk size in tokens")
-    chunk_overlap: int = Field(200, description="Overlap between chunks")
+    chunk_size: int = Field(settings.CHUNK_SIZE, description="Target chunk size in tokens")
+    chunk_overlap: int = Field(settings.CHUNK_OVERLAP, description="Overlap between chunks")
     chunking_strategy: str = Field("semantic", description="Chunking strategy")
 
 
@@ -242,7 +244,7 @@ class IngestFolderRequest(BaseModel):
     collection_title: str = Field(..., description="Collection name/ID")
     llm_model: Optional[str] = Field(None, description="LLM model to use")
     recursive: bool = Field(True, description="Process subdirectories recursively")
-    chunk_size: int = Field(1000, description="Target chunk size in tokens")
-    chunk_overlap: int = Field(200, description="Overlap between chunks")
+    chunk_size: int = Field(settings.CHUNK_SIZE, description="Target chunk size in tokens")
+    chunk_overlap: int = Field(settings.CHUNK_OVERLAP, description="Overlap between chunks")
     chunking_strategy: str = Field("semantic", description="Chunking strategy")
     embedding_model_name: Optional[str] = Field(None, description="Embedding model to use")
