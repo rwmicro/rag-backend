@@ -41,6 +41,10 @@ class RetrievalMetrics:
     rerank_scores: List[float] = field(default_factory=list)
     final_scores: List[float] = field(default_factory=list)
     deduplication_removed: int = 0
+    # Total chunks dropped by relevance floors (MIN_SIMILARITY_SCORE before
+    # rerank + MIN_RERANKER_SCORE after). Was previously set as an undeclared
+    # attribute, which asdict()-based serialization silently dropped.
+    filtered_by_min_score: int = 0
     normalization_method: Optional[str] = None
 
 

@@ -1,17 +1,21 @@
 # Development and Testing Dependencies
 
 # Code formatting and linting
-black>=24.1.0,<25.0.0
+# black floor: security advisory fixed in 26.3.1
+black>=26.3.1,<27.0.0
 isort>=5.13.0,<6.0.0
 flake8>=7.0.0,<8.0.0
 flake8-docstrings>=1.7.0,<2.0.0
 mypy>=1.8.0,<2.0.0
 
 # Testing
-pytest>=7.4.0,<8.0.0
-pytest-cov>=4.1.0,<5.0.0
-pytest-asyncio>=0.23.0,<1.0.0
-pytest-mock>=3.12.0,<4.0.0
+# pytest floor: security advisory fixed in 9.0.3.
+# pytest 9 drags pytest-asyncio to 1.x and pytest-cov to >=5 (older ones
+# declare pytest<8/<9); asyncio_mode="auto" in pyproject.toml still applies.
+pytest>=9.0.3,<10.0.0
+pytest-cov>=5.0.0,<8.0.0
+pytest-asyncio>=1.0.0,<2.0.0
+pytest-mock>=3.14.0,<4.0.0
 httpx>=0.26.0,<0.28.0  # For testing FastAPI endpoints
 
 # Pre-commit hooks

@@ -655,6 +655,112 @@ app.include_router(evaluate_router)
 # ============================================================================
 
 
+def _get_pinned_files(collection_id: Optional[str]) -> List[str]:
+    """Filenames pinned in this collection (empty when none or no collection)."""
+    if not collection_id:
+        return []
+    collection = _get_collections_db().get(collection_id)
+    if not collection:
+        return []
+    return list(collection.get("pinned_files", []))
+
+
+def _inject_pinned_chunks(
+    vector_store: Any,
+    pinned_files: List[str],
+    chunks_with_scores: List[Tuple[Any, float]],
+    query_log: Any,
+) -> List[Tuple[Any, float]]:
+    """Prepend pinned documents (full text) to the context.
+
+    AnythingLLM-style pinning: the whole document goes to the LLM regardless of
+    retrieval. Implementation notes:
+    - The full text is reconstructed from the document's chunks in chunk_index
+      order — there is no separate full-text store.
+    - Retrieved chunks belonging to a pinned file are dropped first (their
+      content is already inside the pinned copy; keeping them wastes tokens).
+    - PINNED_MAX_TOKENS caps the total (approximated at 4 chars/token); beyond
+      it, remaining pinned content is dropped with a warning.
+    """
+    getter = getattr(vector_store, "get_chunks_by_filename", None)
+    if getter is None:
+        logger.warning(
+            f"{type(vector_store).__name__} does not support pinning; ignoring "
+            f"{len(pinned_files)} pinned file(s)"
+        )
+        return chunks_with_scores
+
+    pinned_set = set(pinned_files)
+    kept = [
+        (chunk, score)
+        for chunk, score in chunks_with_scores
+        if chunk.metadata.get("filename") not in pinned_set
+    ]
+
+    char_budget = settings.PINNED_MAX_TOKENS * 4
+    used = 0
+    truncated = False
+    pinned_chunks: List[Tuple[Any, float]] = []
+    for filename in pinned_files:
+        for chunk in getter(filename):
+            if used + len(chunk.content) > char_budget:
+                truncated = True
+                break
+            pinned_chunks.append((chunk, 1.0))
+            used += len(chunk.content)
+        if truncated:
+            logger.warning(
+                f"Pinned content exceeds PINNED_MAX_TOKENS "
+                f"({settings.PINNED_MAX_TOKENS}); dropping the remainder "
+                f"starting at '{filename}'"
+            )
+            break
+
+    if pinned_chunks:
+        logger.info(
+            f"Injected {len(pinned_chunks)} pinned chunk(s) from "
+            f"{len(pinned_files)} file(s) (~{used // 4} tokens)"
+        )
+        query_log.metadata["pinned_files"] = pinned_files
+        query_log.metadata["pinned_chunks"] = len(pinned_chunks)
+
+    return pinned_chunks + kept
+
+
+def _apply_reranker_floor(
+    chunks_with_scores: List[Tuple[Any, float]],
+    query_log: Any,
+) -> List[Tuple[Any, float]]:
+    """Drop chunks whose cross-encoder score is below MIN_RERANKER_SCORE.
+
+    Cross-encoder scores only: CrossEncoder applies a sigmoid for single-label
+    models, so these are absolute scores in (0, 1) and an irrelevant chunk sits
+    near 0 regardless of what else was retrieved. The min-max-normalized hybrid
+    scores upstream cannot be thresholded like this (their top hit is always
+    1.0), and the LLM reranker uses its own scale — hence the type check.
+
+    Dropping everything is a legitimate outcome: the caller turns an empty list
+    into the "no relevant documents" response instead of generating from noise.
+    """
+    if settings.RERANKER_TYPE == "llm" or settings.MIN_RERANKER_SCORE <= 0:
+        return chunks_with_scores
+
+    kept = [
+        (chunk, score)
+        for chunk, score in chunks_with_scores
+        if score >= settings.MIN_RERANKER_SCORE
+    ]
+    dropped = len(chunks_with_scores) - len(kept)
+    if dropped:
+        logger.info(
+            f"Relevance floor ({settings.MIN_RERANKER_SCORE}): "
+            f"dropped {dropped}/{len(chunks_with_scores)} chunk(s) below it"
+        )
+        # += : accumulates with the pre-rerank MIN_SIMILARITY_SCORE filter
+        query_log.retrieval.filtered_by_min_score += dropped
+    return kept
+
+
 def _execute_rag_pipeline(
     request: QueryRequest,
     query_log: Any,
@@ -769,6 +875,14 @@ def _execute_rag_pipeline(
                         temperature=settings.LLM_TEMPERATURE,
                         max_tokens=settings.LLM_MAX_TOKENS,
                         timeout=effective_timeout,
+                    )
+
+                # Pinned documents bypass the cache too — the cached entry only
+                # holds retrieval results, and pin/unpin can change between hits.
+                cached_pinned = _get_pinned_files(request.collection_id)
+                if cached_pinned:
+                    cached_results = _inject_pinned_chunks(
+                        vector_store, cached_pinned, cached_results, query_log
                     )
 
                 return (
@@ -1294,6 +1408,8 @@ def _execute_rag_pipeline(
                 embedding_model=current_embedding_model,
             )
 
+            chunks_with_scores = _apply_reranker_floor(chunks_with_scores, query_log)
+
             query_log.timing.reranking_ms = (time.time() - rerank_start) * 1000
             query_log.retrieval.deduplication_removed = initial_count - len(
                 chunks_with_scores
@@ -1342,6 +1458,16 @@ def _execute_rag_pipeline(
         chunks_with_scores = compressor.compress(
             chunks_with_scores=chunks_with_scores,
             query=contextualized_query,
+        )
+
+    # Step 9.5: Inject pinned documents — after every retrieval/filter/compress
+    # step on purpose: pinning means "always in context, in full", so it must
+    # bypass the relevance floor and compression. This can also rescue the
+    # zero-result case: pinned content alone is a valid context.
+    pinned_files = _get_pinned_files(request.collection_id)
+    if pinned_files:
+        chunks_with_scores = _inject_pinned_chunks(
+            vector_store, pinned_files, chunks_with_scores, query_log
         )
 
     # Step 10: Get collection-specific LLM model (with per-request overrides)
@@ -1737,8 +1863,8 @@ async def ingest_file(
     file: UploadFile = File(...),
     collection_title: Optional[str] = Form(None),
     llm_model: Optional[str] = Form(None),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
+    chunk_size: int = Form(settings.CHUNK_SIZE),
+    chunk_overlap: int = Form(settings.CHUNK_OVERLAP),
     chunking_strategy: str = Form("semantic"),
     embedding_model_name: Optional[str] = Form(None),
     embedding_provider: Optional[str] = Form(
@@ -2058,8 +2184,8 @@ async def ingest_file_async(
     file: UploadFile = File(...),
     collection_title: Optional[str] = Form(None),
     llm_model: Optional[str] = Form(None),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
+    chunk_size: int = Form(settings.CHUNK_SIZE),
+    chunk_overlap: int = Form(settings.CHUNK_OVERLAP),
     chunking_strategy: str = Form("semantic"),
     embedding_model_name: Optional[str] = Form(None),
     embedding_provider: Optional[str] = Form(None),
@@ -2327,8 +2453,8 @@ def ingest_url(
     url: str = Form(...),
     collection_title: str = Form(...),
     llm_model: Optional[str] = Form(None),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
+    chunk_size: int = Form(settings.CHUNK_SIZE),
+    chunk_overlap: int = Form(settings.CHUNK_OVERLAP),
     chunking_strategy: str = Form("semantic"),
     embedding_model_name: Optional[str] = Form(None),
     embedding_provider: Optional[str] = Form(None),
@@ -2683,6 +2809,49 @@ def update_collection(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _set_document_pin(collection_id: str, filename: str, pinned: bool) -> Dict[str, Any]:
+    """Shared pin/unpin logic: validate, mutate pinned_files, persist."""
+    db = _get_collections_db()
+    collection = db.get(collection_id)
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    if filename not in collection.get("files", []):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{filename}' not found in collection '{collection_id}'",
+        )
+
+    pinned_files = list(collection.get("pinned_files", []))
+    if pinned and filename not in pinned_files:
+        pinned_files.append(filename)
+    elif not pinned and filename in pinned_files:
+        pinned_files.remove(filename)
+
+    collection["pinned_files"] = pinned_files
+    db.upsert(collection_id, collection)
+
+    return {
+        "success": True,
+        "collection_id": collection_id,
+        "filename": filename,
+        "pinned": pinned,
+        "pinned_files": pinned_files,
+    }
+
+
+@app.post("/collections/{collection_id}/documents/{filename}/pin")
+def pin_document(collection_id: str, filename: str):
+    """Pin a document: its full text is injected into every query's context
+    for this collection, bypassing retrieval (capped by PINNED_MAX_TOKENS)."""
+    return _set_document_pin(collection_id, filename, pinned=True)
+
+
+@app.delete("/collections/{collection_id}/documents/{filename}/pin")
+def unpin_document(collection_id: str, filename: str):
+    """Remove a document from the collection's pinned list."""
+    return _set_document_pin(collection_id, filename, pinned=False)
+
+
 @app.delete("/collections/{collection_id}/documents/{filename}")
 def delete_document_from_collection(collection_id: str, filename: str):
     """
@@ -2732,6 +2901,10 @@ def delete_document_from_collection(collection_id: str, filename: str):
 
         # Remove file from collection metadata
         collection["files"].remove(filename)
+
+        # A deleted document must not stay pinned — its chunks are gone.
+        if filename in collection.get("pinned_files", []):
+            collection["pinned_files"].remove(filename)
 
         # Update document count
         if "document_count" in collection:

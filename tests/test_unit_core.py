@@ -55,10 +55,14 @@ def test_query_request_llm_timeout_range():
 def test_ingest_folder_request_round_trip():
     from rag.schemas import IngestFolderRequest
 
+    from config.settings import settings
+
     payload = {"folder_path": "/tmp/docs", "collection_title": "Test"}
     req = IngestFolderRequest(**payload)
     assert req.recursive is True
-    assert req.chunk_size == 1000
+    # The schema default follows settings so chunk sizing has one source of
+    # truth (it used to hardcode 1000, which silently diverged).
+    assert req.chunk_size == settings.CHUNK_SIZE
     assert req.chunking_strategy == "semantic"
 
 

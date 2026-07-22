@@ -11,6 +11,8 @@ Retrieval-Augmented Generation service for document-based search and answer gene
 - **Vector stores**: FAISS, LanceDB, ChromaDB, SQLite-VSS
 - **Retrieval**: Hybrid (vector + BM25), Graph RAG, HyDE, Multi-query, Multi-hop, Contrastive
 - **Corrective RAG**: grades the retrieved set and retries with a rewritten query
+- **Relevance floor**: cross-encoder scores below `MIN_RERANKER_SCORE` are dropped, so "no answer in the corpus" yields no context instead of noise
+- **Document pinning**: pinned documents are injected in full into every query's context, bypassing retrieval (capped by `PINNED_MAX_TOKENS`)
 - **Reranking**: BGE cross-encoder
 - **LLM**: Ollama (default), any OpenAI-compatible API
 - **Multilingual**: 20+ languages in retrieval, 100+ in detection
@@ -68,7 +70,15 @@ GET    /collections/{id}
 PATCH  /collections/{id}?llm_model=llama3.2
 DELETE /collections/{id}
 DELETE /collections/{id}/documents/{filename}
+POST   /collections/{id}/documents/{filename}/pin
+DELETE /collections/{id}/documents/{filename}/pin
 ```
+
+Pinning injects the document's full text into every query on the collection —
+use it for reference documents the LLM should always see (methodology notes,
+checklists). Pinned content bypasses retrieval, the relevance floor and
+compression; `PINNED_MAX_TOKENS` (default 2000) caps what it may consume.
+Deleting a document unpins it.
 
 Deleting a document rebuilds the FAISS index from the embeddings that remain.
 If the stored embeddings file is missing or out of sync the rebuild cannot be
@@ -82,7 +92,7 @@ nothing is modified — re-ingest the collection to regenerate it, then retry.
 curl -X POST http://localhost:8001/ingest/file \
   -F "file=@document.pdf" \
   -F "collection_title=my_docs" \
-  -F "chunk_size=1000" \
+  -F "chunk_size=450" \
   -F "chunking_strategy=semantic"
 ```
 
@@ -90,6 +100,13 @@ curl -X POST http://localhost:8001/ingest/file \
 Fragments shorter than `min_chunk_size` (default `max(50, chunk_size // 2)`
 tokens) are dropped, so a small `chunk_size` on short documents can legitimately
 yield no chunks.
+
+Keep `chunk_size` under the embedding model's token window:
+`multilingual-e5-large` truncates at **512 tokens**, so anything past that in a
+chunk is embedded as nothing — invisible to retrieval while still being sent to
+the LLM. The default is 450 for this reason, and the embedder logs a warning
+whenever a text would be truncated. Documents ingested with the old 1000-token
+default should be re-ingested to benefit.
 
 Strategies are `semantic`, `recursive`, `markdown`, or `smart` — which picks one
 per document from the file extension and, for Markdown, whether it actually has
@@ -187,8 +204,10 @@ Query
   → Corrective loop: grade + retry with a rewritten query (optional)
   → Graph RAG enhancement (optional)
   → Reranking + deduplication
+  → Relevance floor (MIN_RERANKER_SCORE)
   → MMR diversity (optional)
   → Context compression (optional)
+  → Pinned documents injected (full text)
   → LLM generation (streaming or blocking)
   → Answer verification (optional)
 ```
@@ -286,7 +305,7 @@ models on first run (e5-large, ~2.2 GB), as do the Graph RAG tests, so mount a
 cache to keep reruns cheap:
 
 ```bash
--v /tmp/hfcache:/tmp/hfcache -e HF_HOME=/tmp/hfcache -e EMBEDDING_DEVICE=cpu
+-v ~/.cache/rag-hfcache:/hfcache -e HF_HOME=/hfcache -e EMBEDDING_DEVICE=cpu
 ```
 
 Tests redirect every store to a temp directory (`tests/conftest.py`), so a run

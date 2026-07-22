@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     RERANKER_TYPE: str = "cross-encoder"   # "cross-encoder" or "llm"
     RERANKER_DOMAIN: str = "general"
     USE_RERANKING: bool = True
+    # Relevance floor applied to CROSS-ENCODER scores after reranking (CrossEncoder
+    # applies a sigmoid for single-label models, so scores live in (0, 1) and an
+    # absolute threshold is meaningful — unlike the min-max-normalized hybrid
+    # scores, whose top hit is always 1.0). Chunks below the floor are dropped so
+    # "the corpus has no answer" is caught before generation. 0 disables.
+    MIN_RERANKER_SCORE: float = 0.3
 
     # =============================================================================
     # CACHE (Disk-based cache - simple and efficient for local use)
@@ -164,8 +170,13 @@ class Settings(BaseSettings):
     # These are fallback values. Users should specify them in API requests.
 
     # Chunking defaults (for /ingest/file endpoint)
-    CHUNK_SIZE: int = 1000
-    CHUNK_OVERLAP: int = 200
+    # Sized to fit the embedder: multilingual-e5-large truncates at 512 tokens,
+    # and the "passage: " prefix plus optional contextual-summary prefix eat into
+    # that budget. At the old default of 1000 the second half of every chunk was
+    # embedded as nothing — retrieval could not see it. Keep CHUNK_SIZE under the
+    # embedding model's max_seq_length (EmbeddingModel warns when it is not).
+    CHUNK_SIZE: int = 450
+    CHUNK_OVERLAP: int = 80
     MIN_CHUNK_SIZE: int = 100
     CHUNKING_STRATEGY: str = "semantic"
 
@@ -207,6 +218,14 @@ class Settings(BaseSettings):
     # CONTEXTUAL SUMMARIES
     # =============================================================================
     CONTEXT_SUMMARY_MAX_TOKENS: int = 150   # ~2-3 sentences
+
+    # =============================================================================
+    # DOCUMENT PINNING
+    # =============================================================================
+    # Pinned documents are injected into the LLM context in full, bypassing
+    # retrieval. This caps how much of the context window they may consume
+    # (approximate tokens); content beyond the budget is dropped with a warning.
+    PINNED_MAX_TOKENS: int = 2000
 
     # =============================================================================
     # MULTILINGUAL PIPELINE (opt-in; consumed by create_multilingual_pipeline)
